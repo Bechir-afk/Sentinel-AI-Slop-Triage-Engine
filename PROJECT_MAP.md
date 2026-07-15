@@ -81,13 +81,14 @@ GitHub PR opened
 ## REPOSITORY LAYOUT
 
 ```
-cmd/sentinel/main.go        Config load, dependency wiring, ListenAndServe
+cmd/sentinel/main.go        Config load, dependency wiring, ListenAndServe, /healthz
+internal/config/            Env-var config load + validation
 internal/verify/            HMAC-SHA256 constant-time middleware
 internal/webhook/           Payload parsing + pipeline orchestration
 internal/github/            REST client: fetch diff, add label, post comment
 internal/triage/            Gemini client + JSON schema + prompt
 deploy/Dockerfile           Multi-stage build → distroless static:nonroot
-go.mod / go.sum
+go.mod                      No go.sum: zero third-party dependencies (pure stdlib)
 ```
 
 ---
@@ -102,14 +103,46 @@ go.mod / go.sum
    runs non-root.
 3. **No auto-close.** Original brief mentioned closing PRs; decided against it to
    keep a human in the loop and minimize false-positive blast radius.
+4. **Gemini via REST, not the Go SDK.** Dropped `google.golang.org/genai` and call
+   the `generateContent` endpoint over stdlib `net/http` — same as GitHub. Result:
+   zero third-party dependencies, so the service builds and tests fully offline.
+5. **OpenShift removed** (user decision). Docker image is the deployment unit.
 
 ---
 
 ## OUT OF SCOPE (do not build)
 
-- Live OpenShift/Kubernetes deployment (manifests only).
+- OpenShift/Kubernetes manifests or live deploy (removed by user decision).
 - Auto-closing PRs.
 - Persistence / database / queue.
 - Retry/backoff beyond a single attempt (add later if rate limits bite).
 - Any certificate/badge generator (unrelated project from the source brief; excluded).
+
+---
+
+## STATUS (updated 2026-07-15)
+
+**Complete and verified.** `go build ./...`, `go vet ./...`, and `go test ./...`
+all pass (github, triage, verify, webhook packages). Built with Go 1.26.5.
+
+| Stage | SYSTEM_FLOW | Implementation | Tested |
+|-------|-------------|----------------|--------|
+| 1 | HMAC verify | `internal/verify` | valid / invalid / missing / empty-secret |
+| 2 | Parse payload | `internal/webhook` | actionable + ignored actions |
+| 3 | Fetch diff | `internal/github` | headers, route, non-200 → error |
+| 4 | Triage | `internal/triage` | schema sent, verdict parsed, non-200 → error |
+| 5 | Act | `internal/webhook` + `internal/github` | slop→label+comment, clean→no-op, low-confidence→no-op, fail-open |
+
+Full pipeline covered end-to-end in `internal/webhook/webhook_test.go` with fake
+GitHub + Gemini servers (`httptest`), no network required.
+
+---
+
+## ORPHANS & PENDING
+
+- **Remote push pending:** local git repo initialized and committed (root commit
+  `53213fe`). Pushing to GitHub is blocked — the `gh` CLI is not installed and no
+  remote is configured. Needs either `gh auth login` or a manual `git remote add`.
+- No live Gemini/GitHub credentials exercised; runtime verified only against fake
+  servers. A first real PR is the final smoke test.
 ```
