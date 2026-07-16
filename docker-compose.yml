@@ -1,0 +1,42 @@
+# Runs the two Sentinel services together. The gateway is the only public
+# surface (port 8080, GitHub webhook). The model service is reachable only on
+# the internal compose network at http://sentinel-model:9000 — never published,
+# so it needs no auth of its own.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?set in .env}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?set in .env}
+      MODEL_URL: http://sentinel-model:9000
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.90}
+      SLOP_LABEL: ${SLOP_LABEL:-needs-human-review}
+    depends_on:
+      sentinel-model:
+        condition: service_healthy
+    restart: unless-stopped
+
+  sentinel-model:
+    build:
+      context: ./model
+      dockerfile: Dockerfile
+    # Not published to the host — internal network access only.
+    expose:
+      - "9000"
+    environment:
+      MODEL_PATH: /app/model
+      PORT: "9000"
+    volumes:
+      # Mount the fine-tuned artifact produced offline by ml/train.py.
+      - ./model/model:/app/model:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
