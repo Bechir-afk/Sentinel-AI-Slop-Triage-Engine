@@ -21,7 +21,7 @@ func main() {
 	}
 
 	gh := github.New(cfg.GitHubToken, cfg.GitHubAPIBase)
-	tr := triage.New(cfg.GeminiAPIKey, cfg.GeminiAPIBase)
+	tr := triage.New(cfg.ModelURL)
 	handler := webhook.New(*cfg, gh, tr)
 
 	mux := http.NewServeMux()

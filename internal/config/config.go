@@ -12,12 +12,11 @@ import (
 type Config struct {
 	WebhookSecret       string  // GITHUB_WEBHOOK_SECRET — HMAC shared secret
 	GitHubToken         string  // GITHUB_TOKEN — fetch diff + write label/comment
-	GeminiAPIKey        string  // GEMINI_API_KEY — Gemini REST auth
+	ModelURL            string  // MODEL_URL — base URL of the model service
 	ConfidenceThreshold float64 // CONFIDENCE_THRESHOLD — min confidence to act
 	SlopLabel           string  // SLOP_LABEL — label applied to flagged PRs
 	Port                string  // PORT — listen port
 	GitHubAPIBase       string  // GitHub REST base (overridable for tests)
-	GeminiAPIBase       string  // Gemini REST base (overridable for tests)
 }
 
 // Load reads and validates configuration. Required secrets that are missing
@@ -26,18 +25,17 @@ func Load() (*Config, error) {
 	c := &Config{
 		WebhookSecret:       os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GitHubToken:         os.Getenv("GITHUB_TOKEN"),
-		GeminiAPIKey:        os.Getenv("GEMINI_API_KEY"),
+		ModelURL:            os.Getenv("MODEL_URL"),
 		ConfidenceThreshold: 0.90,
 		SlopLabel:           envOr("SLOP_LABEL", "needs-human-review"),
 		Port:                envOr("PORT", "8080"),
 		GitHubAPIBase:       envOr("GITHUB_API_BASE", "https://api.github.com"),
-		GeminiAPIBase:       envOr("GEMINI_API_BASE", "https://generativelanguage.googleapis.com"),
 	}
 
 	for name, val := range map[string]string{
 		"GITHUB_WEBHOOK_SECRET": c.WebhookSecret,
 		"GITHUB_TOKEN":          c.GitHubToken,
-		"GEMINI_API_KEY":        c.GeminiAPIKey,
+		"MODEL_URL":             c.ModelURL,
 	} {
 		if val == "" {
 			return nil, fmt.Errorf("required env var %s is not set", name)

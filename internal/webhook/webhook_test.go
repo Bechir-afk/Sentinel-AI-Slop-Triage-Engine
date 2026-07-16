@@ -135,7 +135,7 @@ func TestDiffFetchErrorFailsOpen(t *testing.T) {
 
 func TestTriageErrorFailsOpen(t *testing.T) {
 	gh := &fakeGitHub{diff: "d"}
-	tr := &fakeTriager{err: errors.New("gemini down")}
+	tr := &fakeTriager{err: errors.New("model down")}
 	h := New(testConfig(), gh, tr)
 
 	rec := post(t, h, openedPayload)
