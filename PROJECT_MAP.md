@@ -277,21 +277,30 @@ PROJECT_MAP.md
 ## STATUS (updated 2026-07-16)
 
 ### Done & verified
-- **Gateway (Go) core** — commits `53213fe`, `d56cbe6`. `go build`, `go vet`,
-  `go test ./...` all pass on Go 1.26.5. HMAC, GitHub client, webhook pipeline,
-  fail-open, Dockerfile all implemented and unit-tested against fake servers.
+- **Gateway (Go) core** — commits `53213fe`, `d56cbe6`. HMAC, GitHub client,
+  webhook pipeline, fail-open, Dockerfile.
+- **Gateway retarget to model service** — `internal/triage` rewritten from the
+  Gemini client to a plain POST `{MODEL_URL}/predict`; `Result` struct and
+  `Analyze` signature unchanged, so `webhook`/`main` wiring is untouched beyond
+  the constructor. `config` drops `GEMINI_API_KEY`/`GEMINI_API_BASE`, adds
+  required `MODEL_URL`. `go build`, `go vet`, `go test ./...` all pass on Go
+  1.26.5; Go dependency count still zero.
 
 ### Pending (the self-trained-model migration)
 | # | Task | Owner | Status |
 |---|------|-------|--------|
 | 1 | Verify/inspect candidate HF dataset (LTPhong) | me (script) + you (judge) | not started |
-| 2 | `ml/collect_prs.py` GitHub scraper | me | not started |
-| 3 | `ml/build_dataset.py` + synthetic slop + split | me build / **you label** | not started |
-| 4 | `ml/train.py` fine-tune CodeBERT | me build / **you run** | not started |
-| 5 | `ml/evaluate.py` metrics; check precision ≥ ~0.85 | me build / **you judge** | not started |
-| 6 | `model/` FastAPI `/predict` service | me | not started |
-| 7 | Rewrite Go `internal/triage` → call `MODEL_URL`; drop `GEMINI_API_KEY` | me | not started |
-| 8 | `docker-compose.yml` (gateway + model) | me | not started |
+| 2 | `ml/collect_prs.py` GitHub scraper | me | **code written** — needs token + run |
+| 3 | `ml/build_dataset.py` + synthetic slop + split | me build / **you label** | **code written** — needs run + human labeling |
+| 4 | `ml/train.py` fine-tune CodeBERT | me build / **you run** | **code written** — needs you to run |
+| 5 | `ml/evaluate.py` metrics; check precision ≥ ~0.85 | me build / **you judge** | **code written** — gates on ≥0.85, needs run |
+| 6 | `model/` FastAPI `/predict` service | me | **code written** — needs trained artifact to serve |
+| 7 | Rewrite Go `internal/triage` → call `MODEL_URL`; drop `GEMINI_API_KEY` | me | **done & verified** |
+| 8 | `docker-compose.yml` (gateway + model) | me | **done** — `docker compose config` validates |
+
+**Remaining to reach a running system:** provide `GITHUB_TOKEN`, run the `ml/`
+pipeline (2→3→4→5), have a human label real rows in step 3 and judge precision in
+step 5. Once the artifact lands in `model/model/`, `docker compose up` serves both.
 
 **Division of labor:** I write all code (scrapers, training, inference, Go rewrite,
 Docker). You provide a GitHub token, run the training (needs local Python/ML deps,
