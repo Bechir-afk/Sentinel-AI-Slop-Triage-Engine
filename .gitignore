@@ -1,3 +1,11 @@
 /sentinel
 /sentinel.exe
 *.out
+
+# ml/ pipeline + model outputs (produced offline, never committed)
+model/model/
+ml/dataset/
+ml/checkpoints/
+ml/raw_prs.jsonl
+__pycache__/
+*.pyc
