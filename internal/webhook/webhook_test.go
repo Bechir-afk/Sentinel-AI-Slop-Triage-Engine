@@ -58,6 +58,8 @@ const openedPayload = `{
 func post(t *testing.T, h *Handler, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "test-delivery-1")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec

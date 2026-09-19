@@ -21,6 +21,11 @@ var actionable = map[string]bool{
 	"synchronize": true,
 }
 
+const (
+	eventHeader    = "X-GitHub-Event"    // GitHub's event-type header
+	deliveryHeader = "X-GitHub-Delivery" // unique per delivery; the idempotency key
+)
+
 // event is the subset of the GitHub pull_request webhook payload we need.
 // The payload does NOT contain the diff itself, only enough to fetch it.
 type event struct {
@@ -74,6 +79,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only pull_request events carry code to triage. Any other (or missing) event
+	// type is acknowledged and ignored with zero API calls (FR-003).
+	if ev := r.Header.Get(eventHeader); ev != "pull_request" {
+		writeOK(w, "ignored event: "+ev)
+		return
+	}
+	// The delivery ID is the idempotency key (used in T009). A pull_request event
+	// without one is malformed.
+	deliveryID := r.Header.Get(deliveryHeader)
+	if deliveryID == "" {
+		http.Error(w, "missing "+deliveryHeader, http.StatusBadRequest)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "cannot read body", http.StatusBadRequest)
@@ -93,7 +112,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	owner, repo, num := ev.Repository.Owner.Login, ev.Repository.Name, ev.Number
-	log.Printf("triaging %s/%s#%d by %s: %q", owner, repo, num, ev.PullRequest.User.Login, ev.PullRequest.Title)
+	log.Printf("triaging %s/%s#%d by %s [delivery %s]: %q", owner, repo, num, ev.PullRequest.User.Login, deliveryID, ev.PullRequest.Title)
 
 	// Stage 3: fetch diff. Fail open on error.
 	diff, err := h.gh.FetchDiff(ctx, owner, repo, num)
