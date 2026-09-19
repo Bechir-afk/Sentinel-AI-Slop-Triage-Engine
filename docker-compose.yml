@@ -17,7 +17,18 @@ services:
       SLOP_LABEL: ${SLOP_LABEL:-needs-human-review}
     depends_on:
       sentinel-model:
-        condition: service_healthy
+        # service_started, not service_healthy: the gateway must come up and fail
+        # open (200, no action) when the model is absent or unhealthy (FR-007).
+        # Waiting on health would couple the gateway's liveness to the model's.
+        condition: service_started
+    # CMD (not CMD-SHELL): distroless has no shell. The binary probes its own
+    # /healthz via the -healthz flag (see cmd/sentinel/main.go).
+    healthcheck:
+      test: ["CMD", "/sentinel", "-healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
 
   sentinel-model:
@@ -39,4 +50,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    restart: unless-stopped
+    # "no", not unless-stopped: a missing artifact makes the service exit(1) with
+    # one clear message (see model/inference.py); restarting would just crash-loop
+    # that same config error forever (FR-008). It stays stopped so the operator
+    # sees the message and fixes the artifact. (docker compose up ignores a
+    # max-retry count, so a bounded on-failure is not portable here.)
+    # ponytail: no auto-recovery from a genuine transient model crash — acceptable
+    # for this single-node scope; an orchestrator with bounded restarts is the
+    # upgrade path if HA is ever needed.
+    restart: "no"

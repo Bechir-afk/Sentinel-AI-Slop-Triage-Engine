@@ -1,0 +1,271 @@
+---
+description: "Task list for Sentinel Observability & Enhancements"
+---
+
+# Tasks: Sentinel Observability & Enhancements
+
+**Input**: Design documents from `/specs/002-enhancements-observability/`
+
+**Prerequisites**: `001-remediate-and-harden` implemented (async ack-then-process,
+delivery-ID ledger, body cap, non-root hardened containers, leakage-free
+evaluation, CI build/vet/test). 002 extends those files; it does not reintroduce
+their changes.
+
+**Tests**: Included for every serving-path change — the constitution (Quality
+Gates) requires success-path AND fail-open tests for serving-path changes, and
+SC-003/004/005/007/008 are test-verified outcomes.
+
+**Organization**: Grouped by user story (spec.md P1–P5) for independent
+implementation.
+
+## Format: `[ID] [P?] [Story] Description`
+
+- **[P]**: Can run in parallel (different files, no dependencies)
+- **[Story]**: Which user story this task belongs to (US1–US5)
+
+## Path Conventions
+
+Two-service repo at root: Go gateway (`cmd/`, `internal/`, `deploy/`), model
+service (`model/`), offline ML (`ml/`), compose + CI at root.
+
+---
+
+## Phase 1: Setup
+
+**Purpose**: Confirm the 001 baseline before layering enhancements.
+
+- [ ] T001 Baseline check: `go build ./...`, `go vet ./...`, `go test ./...`, and
+  `docker compose config` all green; confirm 001's async pipeline + dedup ledger
+  are present (this feature builds on them). Record results.
+
+---
+
+## Phase 2: Foundational (config surface)
+
+**Purpose**: Config flags US1/US2/US3 read.
+
+- [ ] T002 [P] Extend `internal/config/config.go`: add `SHADOW_MODE` (bool, default
+  false), `MODEL_THREADS` (int, default 4, range 1–64, passed to the model service),
+  `GITHUB_MAX_RETRIES` (int, default 2, range 0–5), and `BUILD_VERSION` (string, set
+  via `-ldflags -X`); extend `internal/config/config_test.go` with parse/validation
+  cases (bad bool, out-of-range int).
+- [ ] T003 [P] Add a version variable to `cmd/sentinel/main.go` (`var version = "dev"`)
+  set at build time with `-ldflags "-X main.version=$(git describe --tags --always)"`;
+  document the build flag in the README quickstart.
+
+**Checkpoint**: Config + version compile and pass tests.
+
+---
+
+## Phase 3: User Story 1 - Operational visibility (Priority: P1) — MVP
+
+**Goal**: Structured logs with a correlation ID threaded gateway → model, a stats
+endpoint, and reported build version.
+
+**Independent Test**: Deliver signed events; assert structured log lines carry the
+delivery ID (and no diff/secret), the ID reaches the model log, and stats counters
+advance.
+
+- [ ] T004 [US1] Replace `log.Printf` with `log/slog` (stdlib, JSON handler) across
+  `cmd/sentinel/main.go`, `internal/webhook/webhook.go`, `internal/github/github.go`,
+  `internal/triage/triage.go`; attach a per-delivery logger carrying the
+  `X-GitHub-Delivery` ID (generate a fallback ID when absent). Ensure the diff body,
+  token, and secret are never logged (FR-001, FR-002).
+- [ ] T005 [US1] `internal/triage/triage.go`: send the correlation ID to the model
+  service on `/predict` (e.g. an `X-Correlation-ID` header); `model/app.py` +
+  `model/inference.py`: read it and include it in the model's structured log line for
+  that request (FR-002).
+- [ ] T006 [US1] Add a stats collector using `sync/atomic` counters (received,
+  triaged, flagged, skipped, failed) + a simple latency summary; increment it at the
+  pipeline stages in `internal/webhook/webhook.go`; expose `GET /stats` (JSON) and the
+  build version on `/healthz` in `cmd/sentinel/main.go` (FR-003, FR-004). New file:
+  `internal/webhook/stats.go` (+ `stats_test.go`).
+- [ ] T007 [US1] `model/app.py`: switch to structured logging and report the model
+  build/artifact version on `/healthz` (FR-004).
+- [ ] T008 [US1] Tests: `internal/webhook/webhook_test.go` (or a new `stats_test.go`)
+  assert counters advance correctly across flagged/skipped/failed paths and that a
+  processed delivery's log carries the delivery ID; assert no secret/diff leaks into
+  the captured log output (SC-001, SC-003).
+
+**Checkpoint**: A single PR is traceable end to end; stats reflect reality.
+
+---
+
+## Phase 4: User Story 2 - Safe rollout controls (Priority: P2)
+
+**Goal**: Shadow mode + a versioned, confidence-bearing comment.
+
+**Independent Test**: Shadow on → verdict logged, zero writes; shadow off → label +
+comment posted with confidence + version in the text.
+
+- [ ] T009 [US2] `internal/webhook/webhook.go`: when `cfg.ShadowMode` is true, run the
+  full pipeline and log the would-be verdict at the action point but skip `AddLabel`,
+  `PostComment`, and (US5) the Check Run entirely (FR-005).
+- [ ] T010 [US2] `internal/webhook/webhook.go`: extend the comment builder to include
+  the model confidence and model/artifact version alongside the reason; the version
+  comes from the `/predict` response or the model `/healthz` (FR-006). Thread version
+  through `triage.Result` if needed.
+- [ ] T011 [US2] Tests: `internal/webhook/webhook_test.go` — shadow-on: high-confidence
+  slop produces zero label/comment calls; shadow-off: both calls occur and the comment
+  text contains the confidence and version (SC-004).
+
+**Checkpoint**: Operators can observe before acting; every comment is auditable.
+
+---
+
+## Phase 5: User Story 3 - Serving efficiency & input correctness (Priority: P3)
+
+**Goal**: Warmup + thread bound, correct pair-encoding, bounded transient retry.
+
+**Independent Test**: quickstart V-perf (first-request latency), long-title encoding,
+GitHub 503→503→200 then 503-forever.
+
+- [ ] T012 [US3] `model/inference.py`: replace the literal `f"{title}\n[SEP]\n{diff}"`
+  with the tokenizer's pair API — `tokenizer(title, diff, truncation="only_second",
+  max_length=512)` — so the real separator token is used and the diff (second segment)
+  is the one truncated; cap the title's contribution so it cannot consume the whole
+  window (FR-008). Apply the SAME encoding in `ml/train.py` and `ml/evaluate.py` so
+  train/serve stay identical.
+- [ ] T013 [US3] `model/inference.py` + `model/app.py`: run one warmup forward pass at
+  startup and call `torch.set_num_threads(MODEL_THREADS)` from config (FR-007).
+- [ ] T014 [US3] `internal/github/github.go`: add bounded retry with backoff on 5xx and
+  on 403/429 carrying a rate-limit/retry signal, capped by `GITHUB_MAX_RETRIES` and the
+  remaining triage budget from the request context; never sleep past the budget
+  (FR-009). Keep the method signatures unchanged so `webhook`/`triage` wiring is
+  untouched.
+- [ ] T015 [US3] Tests: `internal/github/github_test.go` — 503×2 then 200 → success
+  after retry; 503 for the whole budget → error returned so the caller fails open
+  (SC-007). Python: a small `model/tests/test_inference.py` asserting a long title
+  still yields diff tokens and the separator is the tokenizer's real token (SC-006).
+
+**Checkpoint**: No cold-start penalty; encoding is correct; brief GitHub blips recover.
+
+---
+
+## Phase 6: User Story 4 - Defense-in-depth security (Priority: P4)
+
+**Goal**: Path-escaping, safetensors, digest-pinned images, vuln scan.
+
+**Independent Test**: quickstart V-sec (artifact load format, crafted owner/repo, CI
+scan on a bad pin).
+
+- [ ] T016 [P] [US4] `internal/github/github.go`: `url.PathEscape` owner and repo in
+  every URL builder (`FetchDiff`, `AddLabel`, `PostComment`) (FR-010); add a
+  `github_test.go` case with a `/`-bearing owner asserting the escaped path.
+- [ ] T017 [P] [US4] `ml/train.py`: save the artifact as safetensors
+  (`save_model(..., safe_serialization=True)` / ensure `.safetensors` output);
+  `model/inference.py`: load with `use_safetensors=True` so no pickle is deserialized
+  at serve time (FR-011).
+- [ ] T018 [P] [US4] Pin every base image by digest: `deploy/Dockerfile`
+  (`golang:1.26@sha256:…`, `gcr.io/distroless/static:nonroot@sha256:…`) and
+  `model/Dockerfile` (`python:3.11-slim@sha256:…`) (FR-012).
+- [ ] T019 [P] [US4] `.github/workflows/ci.yml`: add `govulncheck ./...` (Go) and a
+  Python dependency audit (e.g. `pip-audit -r model/requirements.txt -r
+  ml/requirements.txt`); fail the build on a known advisory (FR-013). (Confirm
+  `.dockerignore` already excludes `.env` and heavy non-Go paths — done in this repo;
+  add a CI assertion if desired.)
+
+**Checkpoint**: Supply chain reproducible; last input edges escaped; scan gating.
+
+---
+
+## Phase 7: User Story 5 - Check Run + feedback loop (Priority: P5)
+
+**Goal**: A Check Run alongside the label, and an out-of-band maintainer-feedback log.
+
+**Independent Test**: quickstart V-ux (Check Run appears; label-removed appends one
+signal row; no serving-path state survives restart).
+
+- [ ] T020 [US5] `internal/github/github.go`: add `CreateCheckRun(ctx, owner, repo,
+  headSHA, conclusion, summary)` (POST `/repos/{o}/{r}/check-runs`); `internal/webhook`
+  extracts the PR head SHA from the payload and, on a flagged verdict (and when not in
+  shadow mode), creates a neutral/observational Check Run reporting the verdict +
+  confidence — never a required/blocking status (FR-014). Fail-open on Check Run error;
+  it MUST NOT block the label/comment path. Add tests (success + fail-open).
+- [ ] T021 [US5] Accept the additional webhook actions needed for feedback
+  (`pull_request` `unlabeled`, and reaction/comment events if used) in
+  `internal/webhook/webhook.go`; on a maintainer removing the slop label (or a 👎), map
+  it to a feedback signal. Reject/ignore feedback for PRs Sentinel never flagged
+  (no fabricated verdict) — see spec edge cases.
+- [ ] T022 [US5] Add an out-of-band, append-only signal writer (new file
+  `internal/webhook/feedback.go`): append one JSON row {pr, original_verdict,
+  confidence, disagreement_type, ts} to a configured path OUTSIDE the request path
+  (buffered/async write; the request still acks fast and holds no state) (FR-015).
+  Add `feedback_test.go` (one row per event; well-formed; no serving-path state).
+- [ ] T023 [US5] `ml/build_dataset.py`: add an optional `--feedback-log <path>` source
+  that folds signal-log rows into the labeled dataset for retraining (FR-016);
+  document the loop in the quickstart.
+
+**Checkpoint**: Verdicts are first-class in the PR UI; maintainer judgment feeds back.
+
+---
+
+## Phase 8: Polish & Cross-Cutting
+
+- [ ] T024 Update `README.md`: document shadow mode, the `/stats` endpoint, the build
+  version flag, retry behavior, the Check Run, and the feedback loop + how to enable the
+  extra webhook events.
+- [ ] T025 Final sweep: `go vet ./...`, `go test ./... -race`, `docker compose config`,
+  and a log scan confirming no diff/secret leakage; record outcomes.
+
+---
+
+## Dependencies & Execution Order
+
+### Phase Dependencies
+
+- **Setup (Phase 1)**: none — start immediately.
+- **Foundational (Phase 2)**: after Phase 1 — provides config for US1/US2/US3.
+- **User Stories**: US1 is the MVP (visibility). US2 depends on T002 (SHADOW_MODE) and
+  reuses US1's version plumbing. US3, US4 are independent of US1/US2 and each other.
+  US5 depends on US2's shadow gate (T009) and US1's logging.
+- **Polish (Phase 8)**: after all desired stories.
+
+### User Story Dependencies
+
+- **US1 (P1)**: Foundational (T002/T003). MVP.
+- **US2 (P2)**: T002 (SHADOW_MODE); comment version reuses US1 plumbing.
+- **US3 (P3)**: independent (T014 Go retry ∥ T012/T013 Python serving).
+- **US4 (P4)**: independent; all four tasks parallelizable.
+- **US5 (P5)**: after US1 (logging) + US2 (shadow gate); best last.
+
+### Parallel Opportunities
+
+- T002 ∥ T003 (Phase 2); T016 ∥ T017 ∥ T018 ∥ T019 (all of US4); US3 ∥ US4 across
+  stories; within US1, T007 (Python) ∥ the Go tasks.
+
+---
+
+## Implementation Strategy
+
+### MVP First (User Story 1 Only)
+
+1. T001 baseline → 2. T002/T003 (config + version) → 3. T004–T008 (US1) → STOP and
+   VALIDATE: the running system is now observable and traceable. Everything past this
+   is safety, efficiency, and features.
+
+### Incremental Delivery
+
+1. US1 → observable  2. US2 → safe rollout  3. US3 → efficient + correct
+4. US4 → hardened supply chain  5. US5 → Check Run + feedback  6. Polish.
+
+### Parallel Team Strategy
+
+- Dev A: US1 → US2 (Go observability + rollout track)
+- Dev B: US3 Python serving (T012/T013) + US4 T017 (ML/artifact track)
+- Dev C: US3 T014 + US4 T016/T018/T019 (Go/security/supply-chain track)
+- US5 folded in after US1/US2 land.
+
+---
+
+## Notes
+
+- Constitution guardrails apply to every task: never auto-close (the Check Run is
+  observational, never a required status), fail-open (retry, Check Run, and feedback
+  all degrade to no-action on error), zero third-party Go deps (slog + atomic are
+  stdlib; retry is stdlib), self-hosted model, classify value not provenance.
+- FR-015 introduces the ONLY persistence in the project, and it is deliberately
+  out-of-band and off the serving path (append-only log read solely by `ml/`). If the
+  maintainer rejects any serving-adjacent persistence, defer T021–T023 and ship the
+  Check Run (T020) alone.
+- Commit after each task or logical group; run `go test ./...` before each commit.

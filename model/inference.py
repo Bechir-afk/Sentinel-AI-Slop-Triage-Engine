@@ -9,6 +9,7 @@ See PROJECT_MAP MODEL section for the contract.
 import logging
 import os
 import re
+import sys
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -18,6 +19,47 @@ logger = logging.getLogger("sentinel.model")
 MODEL_PATH = os.getenv("MODEL_PATH", "./model")
 MAX_TOKENS = 512
 SLOP = 1
+
+# A usable artifact directory has a model config, a weights file, and tokenizer
+# files. We accept either safetensors or the legacy .bin weights (T017 moves us
+# to safetensors) and any of the RoBERTa/CodeBERT tokenizer layouts.
+_REQUIRED_ANY = {
+    "weights": ("model.safetensors", "pytorch_model.bin"),
+    "tokenizer": ("tokenizer.json", "vocab.json", "tokenizer_config.json"),
+}
+
+
+def _verify_artifact(path: str) -> None:
+    """Fail fast with ONE actionable line if the artifact is missing/incomplete.
+
+    Without this, from_pretrained raises a long Hugging Face stack trace on a
+    missing artifact and — with the container's restart policy — crash-loops with
+    no explanation (FR-008). Here we check first and exit(1) with the path and the
+    command that produces the artifact, so an operator sees exactly what to do.
+    """
+    problems = []
+    if not os.path.isdir(path):
+        problems.append(f"directory {path!r} does not exist")
+    else:
+        if not os.path.isfile(os.path.join(path, "config.json")):
+            problems.append("missing config.json")
+        for kind, names in _REQUIRED_ANY.items():
+            if not any(os.path.isfile(os.path.join(path, n)) for n in names):
+                problems.append(f"missing {kind} file (one of: {', '.join(names)})")
+    if problems:
+        logger.error(
+            "model artifact unusable at MODEL_PATH=%s: %s. Produce it offline with "
+            "`python ml/train.py --data ml/dataset --out model/model` (see README "
+            "§Training), then mount that directory at this path.",
+            path,
+            "; ".join(problems),
+        )
+        sys.exit(1)
+
+
+# Verify before loading so a missing artifact is one clear message, not a
+# crash-loop. This runs at import (i.e. model-service startup, via app.py).
+_verify_artifact(MODEL_PATH)
 
 # Loaded once at import; a forward pass reuses these.
 _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)

@@ -1,11 +1,56 @@
+# ── Secrets ─────────────────────────────────────────────────────────────
+# docker-compose.yml requires a .env (GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET).
+# NEVER commit it. .env.example (no secrets) is the tracked template.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Go build artifacts ──────────────────────────────────────────────────
 /sentinel
 /sentinel.exe
 *.out
+*.test
+coverage.txt
 
-# ml/ pipeline + model outputs (produced offline, never committed)
+# ── ml/ pipeline + model outputs (produced offline, never committed) ────
 model/model/
 ml/dataset/
 ml/checkpoints/
 ml/raw_prs.jsonl
+
+# ── Python ──────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── AI-agent tooling / scaffolding (local, not part of the product) ─────
+.opencode/
+.agents/
+.claude/
+AGENTS.md
+opencode.json
+skills-lock.json
+
+# .specify/ holds local spec-kit tooling (scripts, templates, cache). Ignore it,
+# but keep the project constitution — a tracked planning deliverable.
+.specify/*
+!.specify/memory/
+.specify/memory/*
+!.specify/memory/constitution.md
+
+# specs/ holds spec-kit planning docs (spec.md, plan.md, tasks.md) — tracked
+# deliverables, intentionally NOT ignored.
+
+# ── Editor / OS ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

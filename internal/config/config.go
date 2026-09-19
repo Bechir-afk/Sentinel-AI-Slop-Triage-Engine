@@ -17,6 +17,8 @@ type Config struct {
 	SlopLabel           string  // SLOP_LABEL — label applied to flagged PRs
 	Port                string  // PORT — listen port
 	GitHubAPIBase       string  // GitHub REST base (overridable for tests)
+	MaxBodyBytes        int64   // MAX_BODY_BYTES — cap on webhook body size (bytes)
+	WorkerCount         int     // WORKER_COUNT — triage worker-pool size
 }
 
 // Load reads and validates configuration. Required secrets that are missing
@@ -30,6 +32,8 @@ func Load() (*Config, error) {
 		SlopLabel:           envOr("SLOP_LABEL", "needs-human-review"),
 		Port:                envOr("PORT", "8080"),
 		GitHubAPIBase:       envOr("GITHUB_API_BASE", "https://api.github.com"),
+		MaxBodyBytes:        25 << 20, // 26214400 (25 MiB); GitHub caps deliveries ~25MB
+		WorkerCount:         8,
 	}
 
 	for name, val := range map[string]string{
@@ -51,6 +55,28 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("CONFIDENCE_THRESHOLD %v out of range [0,1]", v)
 		}
 		c.ConfidenceThreshold = v
+	}
+
+	if raw := os.Getenv("MAX_BODY_BYTES"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("MAX_BODY_BYTES %q is not an integer: %w", raw, err)
+		}
+		if v < 1024 {
+			return nil, fmt.Errorf("MAX_BODY_BYTES %d below the 1 KiB minimum", v)
+		}
+		c.MaxBodyBytes = v
+	}
+
+	if raw := os.Getenv("WORKER_COUNT"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("WORKER_COUNT %q is not an integer: %w", raw, err)
+		}
+		if v < 1 || v > 64 {
+			return nil, fmt.Errorf("WORKER_COUNT %d out of range [1,64]", v)
+		}
+		c.WorkerCount = v
 	}
 
 	return c, nil

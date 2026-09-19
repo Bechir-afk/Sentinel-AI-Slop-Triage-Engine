@@ -3,3 +3,19 @@
 deploy/Dockerfile
 .dockerignore
 .gitignore
+
+# Secrets must never enter the build context (gateway does COPY . .).
+.env
+.env.*
+
+# The Go gateway only needs go.mod + cmd/ + internal/. Keep the rest out of the
+# build context: Python pipeline, model artifacts, and local agent tooling.
+ml/
+model/
+.opencode/
+.agents/
+.claude/
+.specify/
+specs/
+__pycache__/
+*.pyc
