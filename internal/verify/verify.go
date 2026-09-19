@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 )
@@ -15,12 +16,22 @@ import (
 const signatureHeader = "X-Hub-Signature-256"
 
 // Middleware wraps next, admitting only requests whose body carries a valid
-// signature for secret. The verified body is restored so next can read it.
-func Middleware(secret string, next http.Handler) http.Handler {
+// signature for secret. The body is capped at maxBytes BEFORE it is read, so an
+// unauthenticated caller cannot exhaust memory ahead of the HMAC check
+// (constitution VII: size-cap at the trust boundary). The verified body is
+// restored so next can read it.
+func Middleware(secret string, maxBytes int64, next http.Handler) http.Handler {
 	key := []byte(secret)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			// MaxBytesReader reports an oversized body as *http.MaxBytesError.
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "cannot read body", http.StatusBadRequest)
 			return
 		}

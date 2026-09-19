@@ -35,7 +35,7 @@ func main() {
 	handler := webhook.New(*cfg, gh, tr)
 
 	mux := http.NewServeMux()
-	mux.Handle("/webhook", verify.Middleware(cfg.WebhookSecret, handler))
+	mux.Handle("/webhook", verify.Middleware(cfg.WebhookSecret, cfg.MaxBodyBytes, handler))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

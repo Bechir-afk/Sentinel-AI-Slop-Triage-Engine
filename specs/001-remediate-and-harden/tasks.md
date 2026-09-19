@@ -71,7 +71,8 @@ service (`model/`), offline ML (`ml/`), compose + CI at root.
 
 **Independent Test**: quickstart.md V3 + V4 + V5.
 
-- [ ] T007 [US2] `internal/verify/verify.go`: wrap body with `http.MaxBytesReader(w, r.Body, cfg.MaxBodyBytes)` before `io.ReadAll`; oversized → 413, no HMAC work (FR-006, research R4); extend `internal/verify/verify_test.go`
+- [x] T007 [US2] `internal/verify/verify.go`: wrap body with `http.MaxBytesReader(w, r.Body, cfg.MaxBodyBytes)` before `io.ReadAll`; oversized → 413, no HMAC work (FR-006, research R4); extend `internal/verify/verify_test.go`
+  - **Done (2026-09-19)**: `Middleware` signature is now `Middleware(secret string, maxBytes int64, next http.Handler)`; it wraps `r.Body` in `http.MaxBytesReader` before the read and returns 413 on `*http.MaxBytesError` (else 400), so an oversized body is rejected before any HMAC work (constitution VII, FR-006). Call site in `cmd/sentinel/main.go` passes `cfg.MaxBodyBytes` (T002). New `TestMiddlewareBodyTooLarge` proves an over-cap body — even validly signed — gets 413 and the handler never runs; existing signature tests updated to the new signature and still pass. Full suite green.
 - [ ] T008 [US2] `internal/webhook/webhook.go`: require `X-GitHub-Event == "pull_request"` (missing/other → 200, ignore, zero API calls); reject missing `X-GitHub-Delivery` with 400 (FR-003)
 - [ ] T009 [US2] `internal/webhook/webhook.go`: ack-then-process — handler validates, claims the delivery ID via the ledger (T003), enqueues a job on a buffered channel, returns 200 immediately; worker goroutines (count from T002 config) run the existing pipeline with `context.Background()` + 45s timeout — never `r.Context()` (FR-001, FR-002, research R1/R2)
 - [ ] T010 [US2] `internal/webhook/webhook.go`: skip triage when `pull_request.user.login` has the `[bot]` suffix (FR-005, research R3)

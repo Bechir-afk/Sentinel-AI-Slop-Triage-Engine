@@ -50,7 +50,7 @@ func TestMiddleware(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			next := &spy{}
-			h := Middleware(testSecret, next)
+			h := Middleware(testSecret, 1<<20, next)
 
 			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
 			if tc.signature != "" {
@@ -69,5 +69,27 @@ func TestMiddleware(t *testing.T) {
 				t.Errorf("downstream body = %q, want %q (body not restored)", next.body, body)
 			}
 		})
+	}
+}
+
+func TestMiddlewareBodyTooLarge(t *testing.T) {
+	const maxBytes = 16
+	body := strings.Repeat("x", maxBytes*4) // well over the cap
+
+	next := &spy{}
+	// Sign the oversized body validly — the point is the cap rejects it BEFORE
+	// the HMAC check, so even a correctly-signed oversized body gets a 413.
+	h := Middleware(testSecret, maxBytes, next)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+	req.Header.Set(signatureHeader, sign(testSecret, body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	if next.called {
+		t.Error("handler must not run for an oversized body")
 	}
 }
