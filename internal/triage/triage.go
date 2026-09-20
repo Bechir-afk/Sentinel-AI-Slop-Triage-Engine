@@ -46,6 +46,38 @@ type predictRequest struct {
 	Diff  string `json:"diff"`
 }
 
+// Health is the model service /healthz response (predict-endpoint contract).
+type Health struct {
+	Status    string  `json:"status"`
+	Threshold float64 `json:"threshold"`
+	Artifact  string  `json:"artifact"`
+}
+
+// FetchHealth reads the model service /healthz. The gateway uses this at
+// startup to source its default confidence threshold from the artifact
+// (research R6). Best-effort: any error is the caller's cue to fall back.
+func (c *Client) FetchHealth(ctx context.Context) (*Health, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/healthz", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("model healthz: status %d: %s", resp.StatusCode, raw)
+	}
+	var h Health
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return nil, fmt.Errorf("model healthz: decode: %w", err)
+	}
+	return &h, nil
+}
+
 // Analyze returns the triage verdict for a PR.
 func (c *Client) Analyze(ctx context.Context, title, diff string) (*Result, error) {
 	if len(diff) > maxDiffBytes {

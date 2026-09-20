@@ -22,8 +22,11 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.ConfidenceThreshold != 0.90 {
-		t.Errorf("ConfidenceThreshold = %v, want 0.90", c.ConfidenceThreshold)
+	if c.ConfidenceThreshold != 0.95 {
+		t.Errorf("ConfidenceThreshold = %v, want 0.95", c.ConfidenceThreshold)
+	}
+	if c.ThresholdFromEnv {
+		t.Error("ThresholdFromEnv should be false when CONFIDENCE_THRESHOLD is unset")
 	}
 	if c.SlopLabel != "needs-human-review" {
 		t.Errorf("SlopLabel = %q, want needs-human-review", c.SlopLabel)

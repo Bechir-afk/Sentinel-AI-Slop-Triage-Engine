@@ -36,6 +36,22 @@ func main() {
 
 	gh := github.New(cfg.GitHubToken, cfg.GitHubAPIBase)
 	tr := triage.New(cfg.ModelURL)
+
+	// Source the confidence threshold from the artifact via the model's
+	// /healthz unless the operator set CONFIDENCE_THRESHOLD explicitly (env
+	// wins). Best-effort: if the model is down at startup, keep the built-in
+	// default — the gateway must start independently of model health (FR-007).
+	if !cfg.ThresholdFromEnv {
+		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if h, err := tr.FetchHealth(hctx); err != nil {
+			log.Printf("threshold: model healthz unavailable (%v); using default %.2f", err, cfg.ConfidenceThreshold)
+		} else if h.Threshold > 0 {
+			cfg.ConfidenceThreshold = h.Threshold
+			log.Printf("threshold: sourced %.2f from model artifact %q", h.Threshold, h.Artifact)
+		}
+		hcancel()
+	}
+
 	handler := webhook.New(*cfg, gh, tr)
 	handler.Start() // launch the triage worker pool
 

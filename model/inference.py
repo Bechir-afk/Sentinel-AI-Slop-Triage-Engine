@@ -6,6 +6,7 @@ lightweight heuristic label built from the diff for the PR comment.
 See PROJECT_MAP MODEL section for the contract.
 """
 
+import json
 import logging
 import os
 import re
@@ -19,6 +20,10 @@ logger = logging.getLogger("sentinel.model")
 MODEL_PATH = os.getenv("MODEL_PATH", "./model")
 MAX_TOKENS = 512
 SLOP = 1
+# Conservative fallback when the artifact ships no threshold.json (older
+# artifact): only very high-confidence slop acts. train.py writes the real,
+# validation-selected value.
+DEFAULT_THRESHOLD = 0.95
 
 # A usable artifact directory has a model config, a weights file, and tokenizer
 # files. We accept either safetensors or the legacy .bin weights (T017 moves us
@@ -66,6 +71,29 @@ _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 _model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
 _model.eval()
 logger.info("loaded model from %s", MODEL_PATH)
+
+
+def _load_threshold(path: str) -> tuple[float, float]:
+    """Read (threshold, val_precision) from threshold.json beside the artifact
+    (written by ml/train.py). Falls back to DEFAULT_THRESHOLD if absent so an
+    older artifact still serves conservatively."""
+    fp = os.path.join(path, "threshold.json")
+    if not os.path.isfile(fp):
+        logger.warning("no threshold.json at %s; using default %.2f", fp, DEFAULT_THRESHOLD)
+        return DEFAULT_THRESHOLD, float("nan")
+    try:
+        with open(fp, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return float(data["threshold"]), float(data.get("val_precision", float("nan")))
+    except (ValueError, KeyError, OSError) as e:
+        logger.warning("threshold.json unreadable (%s); using default %.2f", e, DEFAULT_THRESHOLD)
+        return DEFAULT_THRESHOLD, float("nan")
+
+
+THRESHOLD, VAL_PRECISION = _load_threshold(MODEL_PATH)
+# Artifact version: the directory name is the operator-facing artifact tag.
+ARTIFACT_VERSION = os.path.basename(os.path.normpath(MODEL_PATH))
+logger.info("serving at threshold %.2f (artifact %s)", THRESHOLD, ARTIFACT_VERSION)
 
 
 def _encode(title: str, diff: str):

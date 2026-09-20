@@ -82,3 +82,34 @@ func TestAnalyzeBadJSON(t *testing.T) {
 		t.Fatal("expected error on malformed verdict, got nil")
 	}
 }
+
+func TestFetchHealth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			t.Errorf("expected /healthz, got %s", r.URL.Path)
+		}
+		io.WriteString(w, `{"status":"ok","threshold":0.87,"artifact":"model"}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	h, err := c.FetchHealth(context.Background())
+	if err != nil {
+		t.Fatalf("FetchHealth: %v", err)
+	}
+	if h.Threshold != 0.87 || h.Artifact != "model" || h.Status != "ok" {
+		t.Errorf("health = %+v", h)
+	}
+}
+
+func TestFetchHealthErrorOn503(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	if _, err := c.FetchHealth(context.Background()); err == nil {
+		t.Fatal("expected error when healthz returns 503, got nil")
+	}
+}

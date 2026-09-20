@@ -32,7 +32,13 @@ class PredictResponse(BaseModel):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    # threshold + artifact let the gateway source its default cutoff and log
+    # which artifact produced a verdict (predict-endpoint contract).
+    return {
+        "status": "ok",
+        "threshold": inference.THRESHOLD,
+        "artifact": inference.ARTIFACT_VERSION,
+    }
 
 
 @app.post("/predict", response_model=PredictResponse)

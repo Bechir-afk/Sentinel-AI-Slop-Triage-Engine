@@ -14,6 +14,7 @@ type Config struct {
 	GitHubToken         string  // GITHUB_TOKEN — fetch diff + write label/comment
 	ModelURL            string  // MODEL_URL — base URL of the model service
 	ConfidenceThreshold float64 // CONFIDENCE_THRESHOLD — min confidence to act
+	ThresholdFromEnv    bool    // true if CONFIDENCE_THRESHOLD was set explicitly
 	SlopLabel           string  // SLOP_LABEL — label applied to flagged PRs
 	Port                string  // PORT — listen port
 	GitHubAPIBase       string  // GitHub REST base (overridable for tests)
@@ -28,7 +29,7 @@ func Load() (*Config, error) {
 		WebhookSecret:       os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GitHubToken:         os.Getenv("GITHUB_TOKEN"),
 		ModelURL:            os.Getenv("MODEL_URL"),
-		ConfidenceThreshold: 0.90,
+		ConfidenceThreshold: 0.95, // conservative fallback; model /healthz or env override replaces it
 		SlopLabel:           envOr("SLOP_LABEL", "needs-human-review"),
 		Port:                envOr("PORT", "8080"),
 		GitHubAPIBase:       envOr("GITHUB_API_BASE", "https://api.github.com"),
@@ -55,6 +56,7 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("CONFIDENCE_THRESHOLD %v out of range [0,1]", v)
 		}
 		c.ConfidenceThreshold = v
+		c.ThresholdFromEnv = true
 	}
 
 	if raw := os.Getenv("MAX_BODY_BYTES"); raw != "" {
