@@ -4,12 +4,23 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install CPU-only torch + deps first so the layer caches across code edits.
+# Install CPU-only torch in a DEDICATED step from the PyTorch CPU index, so the
+# heavy CUDA build is never pulled (smaller image, no GPU assumptions — R8).
+# Keep the pin in sync with requirements.txt.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+
+# Then the rest of the deps from PyPI (torch is already satisfied above).
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
-    -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py inference.py ./
+
+# Non-root user (FR-013/FR-014). HF_HOME points at /tmp so transformers has a
+# writable cache when the container runs with a read-only rootfs + tmpfs /tmp
+# (compose T018). The artifact itself is mounted read-only at MODEL_PATH.
+ENV HF_HOME=/tmp/hf
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
 
 # The fine-tuned artifact (weights + tokenizer) is mounted or baked at ./model.
 # MODEL_PATH defaults to ./model; PORT defaults to 9000.

@@ -2,8 +2,8 @@
 FROM golang:1.26 AS build
 WORKDIR /src
 
-# No third-party deps: go.mod alone is enough to prime the module cache.
-COPY go.mod ./
+# No third-party deps, so no module cache to prime — COPY . . brings in go.mod
+# and all sources in one step.
 COPY . .
 
 # Static, stripped binary — no libc, no debug info.

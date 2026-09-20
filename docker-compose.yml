@@ -13,7 +13,9 @@ services:
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?set in .env}
       GITHUB_TOKEN: ${GITHUB_TOKEN:?set in .env}
       MODEL_URL: http://sentinel-model:9000
-      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.90}
+      # Unset by default so the gateway sources the threshold from the model
+      # artifact's /healthz; set here only to override (config.ThresholdFromEnv).
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-}
       SLOP_LABEL: ${SLOP_LABEL:-needs-human-review}
     depends_on:
       sentinel-model:
@@ -30,6 +32,17 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+    # Hardening (FR-013, R9): drop all caps, no privilege escalation, read-only
+    # rootfs. The static binary needs no writable filesystem.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+          cpus: "0.5"
 
   sentinel-model:
     build:
@@ -50,6 +63,20 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    # Hardening (FR-013, R9): drop all caps, no privilege escalation, read-only
+    # rootfs with a writable tmpfs /tmp for the HF cache (HF_HOME=/tmp/hf) and
+    # any uvicorn scratch. The artifact mount is already :ro.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
     # "no", not unless-stopped: a missing artifact makes the service exit(1) with
     # one clear message (see model/inference.py); restarting would just crash-loop
     # that same config error forever (FR-008). It stays stopped so the operator

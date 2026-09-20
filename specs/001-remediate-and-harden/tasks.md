@@ -113,9 +113,12 @@ service (`model/`), offline ML (`ml/`), compose + CI at root.
 
 **Independent Test**: quickstart.md V7.
 
-- [ ] T017 [P] [US4] `model/Dockerfile`: install CPU-only torch in a dedicated step with `pip install torch==<pin> --index-url https://download.pytorch.org/whl/cpu`, then the rest from PyPI; add a dedicated non-root user and `USER` it (FR-013, FR-014, research R8)
-- [ ] T018 [US4] `docker-compose.yml`: for both services add `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, `read_only: true` + writable tmpfs `/tmp`, and resource limits (gateway 64m/0.5 cpu; model 2g/2.0 cpu) (FR-013, research R9)
-- [ ] T019 [P] [US4] `deploy/Dockerfile`: drop the redundant `COPY go.mod ./` (the following `COPY . .` supersedes it)
+- [x] T017 [P] [US4] `model/Dockerfile`: install CPU-only torch in a dedicated step with `pip install torch==<pin> --index-url https://download.pytorch.org/whl/cpu`, then the rest from PyPI; add a dedicated non-root user and `USER` it (FR-013, FR-014, research R8)
+  - **Done (2026-09-20)**: dedicated `pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1` step (CPU wheels only, no CUDA pull), then `-r requirements.txt` from PyPI. Added `useradd --uid 10001 appuser` + `USER appuser`, and `ENV HF_HOME=/tmp/hf` so transformers has a writable cache under the read-only rootfs + tmpfs /tmp (T018).
+- [x] T018 [US4] `docker-compose.yml`: for both services add `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, `read_only: true` + writable tmpfs `/tmp`, and resource limits (gateway 64m/0.5 cpu; model 2g/2.0 cpu) (FR-013, research R9)
+  - **Done (2026-09-20)**: both services get `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, `read_only: true`, and `deploy.resources.limits` (gateway 64m/0.5, model 2g/2.0). Model adds `tmpfs: [/tmp]` for the HF cache + uvicorn scratch; the distroless gateway needs no writable FS. Also switched compose `CONFIDENCE_THRESHOLD` default to empty so the gateway sources it from the model artifact (T016) unless overridden. `docker compose config` validates; rendered fields confirmed.
+- [x] T019 [P] [US4] `deploy/Dockerfile`: drop the redundant `COPY go.mod ./` (the following `COPY . .` supersedes it)
+  - **Done (2026-09-20)**: removed the redundant `COPY go.mod ./`; `COPY . .` brings in go.mod + sources in one step (no third-party deps means no cache-priming layer to preserve).
 
 **Checkpoint**: V7 passes; images hardened and ≥ 60% smaller (SC-006).
 
