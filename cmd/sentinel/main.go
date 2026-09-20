@@ -3,10 +3,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"sentinel/internal/config"
@@ -33,6 +37,7 @@ func main() {
 	gh := github.New(cfg.GitHubToken, cfg.GitHubAPIBase)
 	tr := triage.New(cfg.ModelURL)
 	handler := webhook.New(*cfg, gh, tr)
+	handler.Start() // launch the triage worker pool
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", verify.Middleware(cfg.WebhookSecret, cfg.MaxBodyBytes, handler))
@@ -45,10 +50,33 @@ func main() {
 		Addr:              ":" + cfg.Port,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
+	// Shut down on SIGINT/SIGTERM: stop accepting connections, then drain
+	// in-flight triage so an accepted delivery is not lost mid-process.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		stop() // restore default signal handling; a second signal now aborts
+		log.Print("shutdown: draining...")
+
+		shutCtx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+		if err := handler.Shutdown(shutCtx); err != nil {
+			log.Printf("worker drain: %v", err)
+		}
+	}()
+
 	log.Printf("sentinel listening on :%s (threshold=%.2f, label=%q)", cfg.Port, cfg.ConfidenceThreshold, cfg.SlopLabel)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server: %v", err)
 	}
 }
