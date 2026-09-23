@@ -156,16 +156,33 @@ advance.
 **Independent Test**: Shadow on → verdict logged, zero writes; shadow off → label +
 comment posted with confidence + version in the text.
 
-- [ ] T009 [US2] `internal/webhook/webhook.go`: when `cfg.ShadowMode` is true, run the
+- [x] T009 [US2] `internal/webhook/webhook.go`: when `cfg.ShadowMode` is true, run the
   full pipeline and log the would-be verdict at the action point but skip `AddLabel`,
   `PostComment`, and (US5) the Check Run entirely (FR-005).
-- [ ] T010 [US2] `internal/webhook/webhook.go`: extend the comment builder to include
+  <!-- 2026-09-22: shadow gate lives in process() after the flag counter increments —
+  the pipeline (diff fetch + model call + verdict + Flagged++) runs in full, then when
+  cfg.ShadowMode is true we log "shadow mode: would flag" with confidence+reason and
+  return BEFORE act(). So stats reflect reality (an operator sees what *would* be
+  flagged) while zero outward writes happen. The Check Run (T020) sits behind the same
+  gate — it is created in act()/the flagged branch, which shadow returns before. -->
+- [x] T010 [US2] `internal/webhook/webhook.go`: extend the comment builder to include
   the model confidence and model/artifact version alongside the reason; the version
   comes from the `/predict` response or the model `/healthz` (FR-006). Thread version
   through `triage.Result` if needed.
-- [ ] T011 [US2] Tests: `internal/webhook/webhook_test.go` — shadow-on: high-confidence
+  <!-- 2026-09-22: added Version string `json:"version"` to triage.Result; model
+  app.py PredictResponse gains version="" and /predict sets it to
+  inference.ARTIFACT_VERSION (already loaded from the artifact dir name), so the
+  verdict carries its own provenance — no extra /healthz round-trip. comment() now
+  takes *triage.Result and appends a "_Model confidence: NN% · artifact: `ver`_" line
+  (empty version → "unknown", %.0f%%). act() passes res through. -->
+- [x] T011 [US2] Tests: `internal/webhook/webhook_test.go` — shadow-on: high-confidence
   slop produces zero label/comment calls; shadow-off: both calls occur and the comment
   text contains the confidence and version (SC-004).
+  <!-- 2026-09-22: TestShadowModeSuppressesWrites (shadow on: 0 label/0 comment, but
+  Flagged==1 proving the pipeline still ran) and
+  TestShadowOffPostsCommentWithConfidenceAndVersion (shadow off: 1 label/1 comment; the
+  comment text contains "93%" and the artifact version "model-2026-09-22"). Both green
+  under -race. -->
 
 **Checkpoint**: Operators can observe before acting; every comment is auditable.
 
@@ -178,23 +195,56 @@ comment posted with confidence + version in the text.
 **Independent Test**: quickstart V-perf (first-request latency), long-title encoding,
 GitHub 503→503→200 then 503-forever.
 
-- [ ] T012 [US3] `model/inference.py`: replace the literal `f"{title}\n[SEP]\n{diff}"`
+- [x] T012 [US3] `model/inference.py`: replace the literal `f"{title}\n[SEP]\n{diff}"`
   with the tokenizer's pair API — `tokenizer(title, diff, truncation="only_second",
   max_length=512)` — so the real separator token is used and the diff (second segment)
   is the one truncated; cap the title's contribution so it cannot consume the whole
   window (FR-008). Apply the SAME encoding in `ml/train.py` and `ml/evaluate.py` so
   train/serve stay identical.
-- [ ] T013 [US3] `model/inference.py` + `model/app.py`: run one warmup forward pass at
+  <!-- 2026-09-22: new model/encoding.py is the ONE encode_pair (real separator via
+  the pair api, truncation="only_second" so only the diff gives, title pre-capped to
+  TITLE_MAX_TOKENS=64 so a pathological title can't starve the diff). ml/encoding.py
+  is its twin — code body byte-for-byte identical (verified with diff; only docstrings
+  differ, each naming the other as the twin) because model/ and ml/ are separate build
+  contexts with no shared import path. encode_pair accepts a single string (serve/eval)
+  or equal-length lists (batched train). inference._encode, ml/train.py's batched
+  encode closure, and ml/evaluate.py's inference loop all call it. model/Dockerfile
+  COPY includes encoding.py. py_compile green on all five files. -->
+- [x] T013 [US3] `model/inference.py` + `model/app.py`: run one warmup forward pass at
   startup and call `torch.set_num_threads(MODEL_THREADS)` from config (FR-007).
-- [ ] T014 [US3] `internal/github/github.go`: add bounded retry with backoff on 5xx and
+  <!-- 2026-09-22: inference.configure_threads(n) → torch.set_num_threads (no-op n<1)
+  and inference.warmup() → one predict() pass, best-effort (a warmup failure logs a
+  warning, never stops the service). app.py @app.on_event("startup") calls both, in
+  order (threads bound before the warmup pass runs). MODEL_THREADS read from env
+  (default 4) in app.py; docker-compose.yml sets it to 2 to match the model service's
+  cpus limit. -->
+- [x] T014 [US3] `internal/github/github.go`: add bounded retry with backoff on 5xx and
   on 403/429 carrying a rate-limit/retry signal, capped by `GITHUB_MAX_RETRIES` and the
   remaining triage budget from the request context; never sleep past the budget
   (FR-009). Keep the method signatures unchanged so `webhook`/`triage` wiring is
   untouched.
-- [ ] T015 [US3] Tests: `internal/github/github_test.go` — 503×2 then 200 → success
+  <!-- 2026-09-22: new doRetrying(ctx, mk) drives all three calls — mk builds a fresh
+  request per attempt (re-readable POST body). Retries transport errors, 5xx, and
+  403/429 (retryable()); backoff starts at baseBackoff=500ms and doubles. retryAfter()
+  honors Retry-After (secs) then x-ratelimit-reset (unix). Budget guard: if
+  ctx.Deadline() can't cover the next wait, return the last result now so the caller
+  fails open promptly rather than sleeping past the 45s worker budget. Only New() changed
+  signature (now takes maxRetries); FetchDiff/AddLabel/PostComment signatures unchanged,
+  so webhook/triage wiring untouched. main.go passes cfg.GitHubMaxRetries. -->
+- [x] T015 [US3] Tests: `internal/github/github_test.go` — 503×2 then 200 → success
   after retry; 503 for the whole budget → error returned so the caller fails open
   (SC-007). Python: a small `model/tests/test_inference.py` asserting a long title
   still yields diff tokens and the separator is the tokenizer's real token (SC-006).
+  <!-- 2026-09-22: github_test.go adds TestFetchDiffRetriesThenSucceeds (2×503→200,
+  3 server calls), TestFetchDiffFailsOpenAfterExhausting (503 forever → error, exactly
+  initial+2 retries), TestRetryNeverSleepsPastDeadline (50ms budget < 500ms backoff →
+  1 call, no sleep, returns <300ms) and TestRetryHonorsRetryAfter (429 w/ Retry-After:1
+  → waits ≥1s). All green under -race (github pkg 5.08s). model/tests/test_inference.py
+  drives encode_pair with a faithful fake tokenizer (no torch): long title capped to 64
+  tokens with diff tokens surviving, real separator inserted (no literal [SEP]),
+  truncation="only_second", batched-list shape; an extra pass loads a real roberta-base
+  tokenizer when transformers is installed (skips cleanly otherwise). Wired into
+  ci.yml's ml-selfchecks job. All checks pass. -->
 
 **Checkpoint**: No cold-start penalty; encoding is correct; brief GitHub blips recover.
 

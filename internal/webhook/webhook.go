@@ -5,6 +5,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -305,18 +306,27 @@ func (h *Handler) act(ctx context.Context, lg *slog.Logger, owner, repo string, 
 	if err := h.gh.AddLabel(ctx, owner, repo, num, h.cfg.SlopLabel); err != nil {
 		lg.Error("add label failed", "err", err)
 	}
-	if err := h.gh.PostComment(ctx, owner, repo, num, comment(res.Reason)); err != nil {
+	if err := h.gh.PostComment(ctx, owner, repo, num, comment(res)); err != nil {
 		lg.Error("post comment failed", "err", err)
 	}
 }
 
-// comment builds the polite explanation posted to a flagged PR.
-func comment(reason string) string {
+// comment builds the polite explanation posted to a flagged PR. It states the
+// model's confidence and the artifact version alongside the reason so every
+// action is auditable and a maintainer can report a bad call precisely (FR-006).
+func comment(res *triage.Result) string {
+	reason := res.Reason
 	if reason == "" {
 		reason = "the change appears to be low-effort or automatically generated."
 	}
+	version := res.Version
+	if version == "" {
+		version = "unknown"
+	}
 	return "👋 Thanks for the contribution! This PR was automatically flagged for human review because " +
-		reason + "\n\nA maintainer will take a look. If you believe this was a mistake, please add context explaining the change. — _Sentinel_"
+		reason +
+		fmt.Sprintf("\n\n_Model confidence: %.0f%% · artifact: `%s`_", res.Confidence*100, version) +
+		"\n\nA maintainer will take a look. If you believe this was a mistake, please add context explaining the change. — _Sentinel_"
 }
 
 func writeOK(w http.ResponseWriter, msg string) {

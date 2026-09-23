@@ -436,3 +436,45 @@ func TestAckIsFastWhileTriageBlocks(t *testing.T) {
 	close(bt.release) // let the worker finish so drain doesn't wait on it
 	drain(t, h)
 }
+
+// SC-004 (shadow on): a high-confidence slop verdict writes nothing outward —
+// the pipeline runs (Flagged advances) but no label or comment is posted.
+func TestShadowModeSuppressesWrites(t *testing.T) {
+	gh := &fakeGitHub{diff: "some diff"}
+	tr := &fakeTriager{res: &triage.Result{IsSlop: true, Confidence: 0.99, Reason: "boilerplate", Version: "v1"}}
+	cfg := testConfig()
+	cfg.ShadowMode = true
+	h := newStarted(cfg, gh, tr)
+
+	post(t, h, openedPayload)
+	drain(t, h)
+
+	if gh.labels() != 0 || gh.comments() != 0 {
+		t.Errorf("shadow mode should write nothing; labels=%d comments=%d", gh.labels(), gh.comments())
+	}
+	if s := h.Stats(); s.Flagged != 1 {
+		t.Errorf("shadow mode should still run the pipeline and count the flag; Flagged=%d, want 1", s.Flagged)
+	}
+}
+
+// SC-004 (shadow off) + FR-006: with shadow off, both writes occur and the
+// comment cites the model confidence and artifact version.
+func TestShadowOffPostsCommentWithConfidenceAndVersion(t *testing.T) {
+	gh := &fakeGitHub{diff: "some diff"}
+	tr := &fakeTriager{res: &triage.Result{IsSlop: true, Confidence: 0.93, Reason: "boilerplate", Version: "model-2026-09-22"}}
+	h := newStarted(testConfig(), gh, tr) // ShadowMode false by default
+
+	post(t, h, openedPayload)
+	drain(t, h)
+
+	if gh.labels() != 1 || gh.comments() != 1 {
+		t.Fatalf("expected 1 label+1 comment; labels=%d comments=%d", gh.labels(), gh.comments())
+	}
+	c := gh.comment()
+	if !strings.Contains(c, "93%") {
+		t.Errorf("comment missing confidence; got: %q", c)
+	}
+	if !strings.Contains(c, "model-2026-09-22") {
+		t.Errorf("comment missing artifact version; got: %q", c)
+	}
+}

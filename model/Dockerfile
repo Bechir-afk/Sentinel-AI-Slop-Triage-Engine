@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py inference.py ./
+COPY app.py inference.py encoding.py ./
 
 # Non-root user (FR-013/FR-014). HF_HOME points at /tmp so transformers has a
 # writable cache when the container runs with a read-only rootfs + tmpfs /tmp

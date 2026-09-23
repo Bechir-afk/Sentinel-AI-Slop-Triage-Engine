@@ -54,6 +54,9 @@ services:
     environment:
       MODEL_PATH: /app/model
       PORT: "9000"
+      # Cap torch intra-op threads to the container's cpus limit so it doesn't
+      # oversubscribe cores (FR-007). Keep in sync with the `cpus` below.
+      MODEL_THREADS: ${MODEL_THREADS:-2}
     volumes:
       # Mount the fine-tuned artifact produced offline by ml/train.py.
       - ./model/model:/app/model:ro

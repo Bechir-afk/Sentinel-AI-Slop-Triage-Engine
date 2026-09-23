@@ -1,8 +1,10 @@
 """Task 4: fine-tune CodeBERT + classification head, save the artifact.
 
-Loads the parquet splits from build_dataset.py, encodes '<title>\\n[SEP]\\n<diff>'
-to 512 tokens, and fine-tunes microsoft/codebert-base with a 2-class head
-(LEGIT=0, SLOP=1). Saves weights + tokenizer to --out so the model service can
+Loads the parquet splits from build_dataset.py, encodes the (title, diff) pair
+with the shared encoding.encode_pair (real separator, diff-only truncation — the
+SAME code the model service uses at serve time), and fine-tunes
+microsoft/codebert-base with a 2-class head (LEGIT=0, SLOP=1). Saves weights +
+tokenizer to --out so the model service can
 AutoModelForSequenceClassification.from_pretrained(MODEL_PATH).
 
 After training it reports SLOP precision/recall/F1 + confusion on the
@@ -36,12 +38,13 @@ from transformers import (
 )
 
 from thresholds import SLOP, select_threshold, softmax
+import encoding
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("sentinel.train")
 
 BASE_MODEL = "microsoft/codebert-base"
-MAX_TOKENS = 512
+MAX_TOKENS = encoding.MAX_TOKENS
 SEED = 42
 DEFAULT_BAR = 0.85
 
@@ -51,8 +54,11 @@ def _to_dataset(path: str, tokenizer) -> Dataset:
     ds = Dataset.from_pandas(df, preserve_index=False)
 
     def encode(batch):
-        texts = [f"{t}\n[SEP]\n{d}" for t, d in zip(batch["title"], batch["diff"])]
-        out = tokenizer(texts, truncation=True, max_length=MAX_TOKENS, padding="max_length")
+        # Same pair-encoding the model service uses at serve time (encoding.py),
+        # so train/serve inputs are identical (FR-008).
+        out = encoding.encode_pair(
+            tokenizer, list(batch["title"]), list(batch["diff"]), padding="max_length"
+        )
         out["labels"] = batch["label"]
         return out
 
@@ -99,6 +105,11 @@ def main():
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="slop_f1",
+        # Write model.safetensors, never the legacy pickle pytorch_model.bin, for
+        # both checkpoints and the saved artifact — so the model service loads
+        # weights with no pickle deserialization at serve time (FR-011). Default
+        # True in recent transformers; pinned so a version change can't regress it.
+        save_safetensors=True,
         seed=SEED,
         data_seed=SEED,
         logging_steps=50,

@@ -37,3 +37,7 @@ jobs:
         run: python ml/tests/test_build_dataset.py
       - name: threshold selection check
         run: python ml/tests/test_thresholds.py
+      # Pair-encoding correctness drives encode_pair with a fake tokenizer, so it
+      # verifies the train/serve encoding invariant (SC-006) without torch.
+      - name: pair-encoding check
+        run: python model/tests/test_inference.py

@@ -15,10 +15,12 @@ import sys
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+import encoding
+
 logger = logging.getLogger("sentinel.model")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "./model")
-MAX_TOKENS = 512
+MAX_TOKENS = encoding.MAX_TOKENS
 SLOP = 1
 # Conservative fallback when the artifact ships no threshold.json (older
 # artifact): only very high-confidence slop acts. train.py writes the real,
@@ -96,15 +98,32 @@ ARTIFACT_VERSION = os.path.basename(os.path.normpath(MODEL_PATH))
 logger.info("serving at threshold %.2f (artifact %s)", THRESHOLD, ARTIFACT_VERSION)
 
 
+def configure_threads(n: int) -> None:
+    """Bound intra-op CPU parallelism to n threads. Called once at startup from
+    MODEL_THREADS (app.py) so the container's CPU limit isn't oversubscribed —
+    torch otherwise spawns one thread per core, thrashing under compose's cpus
+    cap (FR-007). No-op for n < 1."""
+    if n and n >= 1:
+        torch.set_num_threads(n)
+        logger.info("torch intra-op threads set to %d", n)
+
+
+def warmup() -> None:
+    """Run one forward pass at startup so the first real request doesn't eat the
+    lazy-init cost (kernel autotuning, allocator warmup) — that latency spike is
+    the difference between a sub-second first triage and a multi-second one
+    (FR-007). Best-effort: a warmup failure must not stop the service."""
+    try:
+        predict("warmup", "diff --git a/x b/x\n+noop\n")
+        logger.info("warmup forward pass complete")
+    except Exception as e:  # noqa: BLE001 — warmup is advisory, never fatal
+        logger.warning("warmup pass failed (continuing): %s", e)
+
+
 def _encode(title: str, diff: str):
-    """Build the '<title>\\n[SEP]\\n<diff>' input, head-truncated to 512 tokens."""
-    text = f"{title}\n[SEP]\n{diff}"
-    return _tokenizer(
-        text,
-        truncation=True,
-        max_length=MAX_TOKENS,
-        return_tensors="pt",
-    )
+    """Encode (title, diff) as a CodeBERT sentence pair (real separator, diff-only
+    truncation) — see encoding.encode_pair. Same code path train.py uses."""
+    return encoding.encode_pair(_tokenizer, title, diff, return_tensors="pt")
 
 
 def _reason(diff: str, is_slop: bool) -> str:

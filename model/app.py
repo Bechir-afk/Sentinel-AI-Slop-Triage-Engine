@@ -19,6 +19,10 @@ import inference
 # Defaults to "dev"; set via the container build/env for a real deployment.
 MODEL_VERSION = os.getenv("MODEL_VERSION", "dev")
 
+# MODEL_THREADS caps torch intra-op parallelism so the container's CPU limit is
+# not oversubscribed (FR-007). Mirrors the gateway's MODEL_THREADS default (4).
+MODEL_THREADS = int(os.getenv("MODEL_THREADS", "4"))
+
 # Structured (JSON) logs so a single PR is machine-traceable across both services
 # by correlation ID, matching the gateway's slog JSON handler (FR-001). Only safe
 # fields are ever logged here — never the diff body.
@@ -47,6 +51,15 @@ logger = logging.getLogger("sentinel.model")
 app = FastAPI(title="sentinel-model")
 
 
+@app.on_event("startup")
+def _on_startup():
+    # Bound CPU threads then warm the model, both once at startup (FR-007): the
+    # thread cap keeps torch from oversubscribing the container's cpus limit, and
+    # the warmup pass moves lazy-init cost off the first real request.
+    inference.configure_threads(MODEL_THREADS)
+    inference.warmup()
+
+
 class PredictRequest(BaseModel):
     title: str = ""
     diff: str = ""
@@ -56,6 +69,9 @@ class PredictResponse(BaseModel):
     is_slop: bool
     confidence: float
     reason: str
+    # Artifact version that produced this verdict, so the gateway can cite it in
+    # the flagged-PR comment for auditability (FR-006).
+    version: str = ""
 
 
 @app.get("/healthz")
@@ -79,6 +95,7 @@ def predict(
     # request's log line so a single PR is traceable across both services. A
     # non-GitHub caller may omit it — never fail on a missing header.
     result = inference.predict(req.title, req.diff)
+    result["version"] = inference.ARTIFACT_VERSION
     logger.info(
         "verdict",
         extra={

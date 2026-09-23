@@ -47,6 +47,10 @@ type Result struct {
 	IsSlop     bool    `json:"is_slop"`
 	Confidence float64 `json:"confidence"`
 	Reason     string  `json:"reason"`
+	// Version is the model/artifact build version that produced this verdict,
+	// echoed into the flagged-PR comment so every action is auditable (FR-006).
+	// Empty for an older model service that predates the field.
+	Version string `json:"version"`
 }
 
 // Client calls the model service /predict endpoint.

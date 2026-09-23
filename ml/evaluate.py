@@ -24,10 +24,12 @@ import torch
 from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+import encoding
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("sentinel.evaluate")
 
-MAX_TOKENS = 512
+MAX_TOKENS = encoding.MAX_TOKENS
 SLOP = 1
 PRECISION_BAR = 0.85
 
@@ -62,8 +64,7 @@ def main():
     slop_probs = []
     with torch.no_grad():
         for title, diff in zip(df["title"], df["diff"]):
-            text = f"{title}\n[SEP]\n{diff}"
-            inputs = tokenizer(text, truncation=True, max_length=MAX_TOKENS, return_tensors="pt")
+            inputs = encoding.encode_pair(tokenizer, title, diff, return_tensors="pt")
             logits = model(**inputs).logits
             slop_probs.append(float(torch.softmax(logits, dim=-1)[0][SLOP].item()))
 

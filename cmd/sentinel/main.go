@@ -66,7 +66,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	gh := github.New(cfg.GitHubToken, cfg.GitHubAPIBase)
+	gh := github.New(cfg.GitHubToken, cfg.GitHubAPIBase, cfg.GitHubMaxRetries)
 	tr := triage.New(cfg.ModelURL)
 
 	// Source the confidence threshold from the artifact via the model's
