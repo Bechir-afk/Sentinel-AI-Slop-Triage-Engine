@@ -1,10 +1,13 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -295,6 +298,121 @@ func TestBotAuthorSkipped(t *testing.T) {
 
 	if gh.labels() > 0 || gh.comments() > 0 {
 		t.Error("bot-authored PR should trigger zero GitHub calls")
+	}
+}
+
+// syncBuffer is a mutex-guarded buffer: worker goroutines log concurrently, so
+// the test's slog sink must be safe for concurrent writes and reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// captureLogs redirects the default slog logger into a buffer for the duration
+// of the test and restores it afterward.
+func captureLogs(t *testing.T) *syncBuffer {
+	t.Helper()
+	prev := slog.Default()
+	sb := &syncBuffer{}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(sb, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return sb
+}
+
+// numberedPayload builds a pull_request "opened" payload with a specific PR
+// number and title so a scripted fake can route behavior per delivery.
+func numberedPayload(number int, title string) string {
+	return `{
+		"action":"opened","number":` + strconv.Itoa(number) + `,
+		"pull_request":{"title":"` + title + `","user":{"login":"dev"}},
+		"repository":{"owner":{"login":"octo"},"name":"repo"}
+	}`
+}
+
+// routingGitHub errors FetchDiff for one PR number (to drive the failed path)
+// and otherwise returns a fixed diff; label/comment counting is inherited.
+type routingGitHub struct {
+	fakeGitHub
+	failOnNumber int
+}
+
+func (r *routingGitHub) FetchDiff(_ context.Context, _, _ string, number int) (string, error) {
+	if number == r.failOnNumber {
+		return "", errors.New("boom")
+	}
+	return r.diff, nil
+}
+
+// routingTriager flags PRs whose title is "slop", passes everything else.
+type routingTriager struct{}
+
+func (routingTriager) Analyze(_ context.Context, title, _ string) (*triage.Result, error) {
+	if title == "slop" {
+		return &triage.Result{IsSlop: true, Confidence: 0.99, Reason: "boilerplate"}, nil
+	}
+	return &triage.Result{IsSlop: false, Confidence: 0.99}, nil
+}
+
+// SC-003: counters match an injected mix of flagged / skipped / failed triages.
+func TestStatsAdvanceAcrossPaths(t *testing.T) {
+	gh := &routingGitHub{fakeGitHub: fakeGitHub{diff: "some diff"}, failOnNumber: 3}
+	h := newStarted(config.Config{ConfidenceThreshold: 0.90, SlopLabel: "x", WorkerCount: 2}, gh, routingTriager{})
+
+	postHeaders(t, h, "pull_request", "d1", numberedPayload(1, "slop"))  // flagged
+	postHeaders(t, h, "pull_request", "d2", numberedPayload(2, "legit")) // skipped (not slop)
+	postHeaders(t, h, "pull_request", "d3", numberedPayload(3, "slop"))  // failed (diff error)
+	drain(t, h)
+
+	s := h.Stats()
+	if s.Received != 3 {
+		t.Errorf("Received = %d, want 3", s.Received)
+	}
+	if s.Flagged != 1 {
+		t.Errorf("Flagged = %d, want 1", s.Flagged)
+	}
+	if s.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1", s.Skipped)
+	}
+	if s.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", s.Failed)
+	}
+	if s.Triaged != 2 {
+		t.Errorf("Triaged = %d, want 2 (flagged+skipped; the failed one never got a verdict)", s.Triaged)
+	}
+	if s.TriageSamples != 2 {
+		t.Errorf("TriageSamples = %d, want 2 (latency recorded only on a completed verdict)", s.TriageSamples)
+	}
+}
+
+// SC-001/SC-003: a processed delivery's logs carry the delivery ID and NEVER
+// contain the diff body.
+func TestLogsCarryDeliveryIDAndNeverLeakDiff(t *testing.T) {
+	logs := captureLogs(t)
+	const diffMarker = "DIFF_BODY_MARKER_must_never_be_logged"
+	gh := &fakeGitHub{diff: diffMarker}
+	tr := &fakeTriager{res: &triage.Result{IsSlop: true, Confidence: 0.99, Reason: "boilerplate"}}
+	h := newStarted(testConfig(), gh, tr)
+
+	postHeaders(t, h, "pull_request", "trace-me-123", openedPayload)
+	drain(t, h)
+
+	out := logs.String()
+	if !strings.Contains(out, "trace-me-123") {
+		t.Errorf("log output missing delivery ID; got:\n%s", out)
+	}
+	if strings.Contains(out, diffMarker) {
+		t.Errorf("log output LEAKED the diff body:\n%s", out)
 	}
 }
 

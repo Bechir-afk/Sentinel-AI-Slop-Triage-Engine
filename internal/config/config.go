@@ -20,6 +20,9 @@ type Config struct {
 	GitHubAPIBase       string  // GitHub REST base (overridable for tests)
 	MaxBodyBytes        int64   // MAX_BODY_BYTES — cap on webhook body size (bytes)
 	WorkerCount         int     // WORKER_COUNT — triage worker-pool size
+	ShadowMode          bool    // SHADOW_MODE — run pipeline, log verdict, write nothing
+	ModelThreads        int     // MODEL_THREADS — model service CPU thread cap (passed through)
+	GitHubMaxRetries    int     // GITHUB_MAX_RETRIES — bounded transient-error retries
 }
 
 // Load reads and validates configuration. Required secrets that are missing
@@ -35,6 +38,8 @@ func Load() (*Config, error) {
 		GitHubAPIBase:       envOr("GITHUB_API_BASE", "https://api.github.com"),
 		MaxBodyBytes:        25 << 20, // 26214400 (25 MiB); GitHub caps deliveries ~25MB
 		WorkerCount:         8,
+		ModelThreads:        4,
+		GitHubMaxRetries:    2,
 	}
 
 	for name, val := range map[string]string{
@@ -81,7 +86,40 @@ func Load() (*Config, error) {
 		c.WorkerCount = v
 	}
 
+	if raw := os.Getenv("SHADOW_MODE"); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("SHADOW_MODE %q is not a boolean: %w", raw, err)
+		}
+		c.ShadowMode = v
+	}
+
+	if err := envInt(&c.ModelThreads, "MODEL_THREADS", 1, 64); err != nil {
+		return nil, err
+	}
+	if err := envInt(&c.GitHubMaxRetries, "GITHUB_MAX_RETRIES", 0, 5); err != nil {
+		return nil, err
+	}
+
 	return c, nil
+}
+
+// envInt parses an optional integer env var into *dst, validating it falls
+// within [min,max]. An unset var leaves *dst (the caller's default) untouched.
+func envInt(dst *int, key string, min, max int) error {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fmt.Errorf("%s %q is not an integer: %w", key, raw, err)
+	}
+	if v < min || v > max {
+		return fmt.Errorf("%s %d out of range [%d,%d]", key, v, min, max)
+	}
+	*dst = v
+	return nil
 }
 
 func envOr(key, fallback string) string {

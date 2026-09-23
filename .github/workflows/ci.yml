@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    name: Go build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test (race)
+        run: go test ./... -race
+
+  ml-selfchecks:
+    name: ML offline self-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The dataset-leakage and threshold-selection checks are stdlib+numpy only
+      # (no torch/transformers), so CI verifies the honest-evaluation invariants
+      # without the multi-GB training stack.
+      - name: install numpy
+        run: pip install numpy
+      - name: build_dataset leakage check
+        run: python ml/tests/test_build_dataset.py
+      - name: threshold selection check
+        run: python ml/tests/test_thresholds.py

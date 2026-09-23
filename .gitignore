@@ -31,10 +31,12 @@ venv/
 .mypy_cache/
 
 # ── AI-agent tooling / scaffolding (local, not part of the product) ─────
+# NOTE: AGENTS.md is intentionally NOT ignored — it is a tracked project
+# deliverable (constitution Principle VIII: Docs Match Shipped Code), unlike
+# these local tool dirs.
 .opencode/
 .agents/
 .claude/
-AGENTS.md
 opencode.json
 skills-lock.json
 

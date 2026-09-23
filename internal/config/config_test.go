@@ -10,7 +10,7 @@ func setRequired(t *testing.T) {
 	t.Setenv("GITHUB_WEBHOOK_SECRET", "secret")
 	t.Setenv("GITHUB_TOKEN", "token")
 	t.Setenv("MODEL_URL", "http://model:9000")
-	for _, k := range []string{"CONFIDENCE_THRESHOLD", "SLOP_LABEL", "PORT", "GITHUB_API_BASE", "MAX_BODY_BYTES", "WORKER_COUNT"} {
+	for _, k := range []string{"CONFIDENCE_THRESHOLD", "SLOP_LABEL", "PORT", "GITHUB_API_BASE", "MAX_BODY_BYTES", "WORKER_COUNT", "SHADOW_MODE", "MODEL_THREADS", "GITHUB_MAX_RETRIES"} {
 		t.Setenv(k, "")
 	}
 }
@@ -39,6 +39,15 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if c.WorkerCount != 8 {
 		t.Errorf("WorkerCount = %d, want 8", c.WorkerCount)
+	}
+	if c.ShadowMode {
+		t.Error("ShadowMode should default to false")
+	}
+	if c.ModelThreads != 4 {
+		t.Errorf("ModelThreads = %d, want 4", c.ModelThreads)
+	}
+	if c.GitHubMaxRetries != 2 {
+		t.Errorf("GitHubMaxRetries = %d, want 2", c.GitHubMaxRetries)
 	}
 	if c.GitHubAPIBase != "https://api.github.com" {
 		t.Errorf("GitHubAPIBase = %q", c.GitHubAPIBase)
@@ -152,6 +161,105 @@ func TestLoadWorkerCount(t *testing.T) {
 			}
 			if c.WorkerCount != tc.want {
 				t.Errorf("WorkerCount = %d, want %d", c.WorkerCount, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadShadowMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		val     string
+		wantErr bool
+		want    bool
+	}{
+		{"true", "true", false, true},
+		{"one", "1", false, true},
+		{"false", "false", false, false},
+		{"not a bool", "yes-please", true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv("SHADOW_MODE", tc.val)
+			c, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.val)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.ShadowMode != tc.want {
+				t.Errorf("ShadowMode = %v, want %v", c.ShadowMode, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadModelThreads(t *testing.T) {
+	tests := []struct {
+		name    string
+		val     string
+		wantErr bool
+		want    int
+	}{
+		{"valid", "8", false, 8},
+		{"not an integer", "lots", true, 0},
+		{"zero out of range", "0", true, 0},
+		{"above range", "65", true, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv("MODEL_THREADS", tc.val)
+			c, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.val)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.ModelThreads != tc.want {
+				t.Errorf("ModelThreads = %d, want %d", c.ModelThreads, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadGitHubMaxRetries(t *testing.T) {
+	tests := []struct {
+		name    string
+		val     string
+		wantErr bool
+		want    int
+	}{
+		{"valid", "3", false, 3},
+		{"zero allowed", "0", false, 0},
+		{"not an integer", "retry", true, 0},
+		{"above range", "6", true, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv("GITHUB_MAX_RETRIES", tc.val)
+			c, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.val)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.GitHubMaxRetries != tc.want {
+				t.Errorf("GitHubMaxRetries = %d, want %d", c.GitHubMaxRetries, tc.want)
 			}
 		})
 	}

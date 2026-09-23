@@ -4,9 +4,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +21,31 @@ import (
 	"sentinel/internal/webhook"
 )
 
+// statsWithVersion is the /stats response: the operational counters plus the
+// gateway build version (FR-003, FR-004).
+type statsWithVersion struct {
+	webhook.Snapshot
+	Version string `json:"version"`
+}
+
+// writeJSON writes v as a JSON body with a 200 status. Endpoint bodies are
+// small and fixed-shape, so an encode error is only logged.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Error("write json response", "err", err)
+	}
+}
+
+// version is the gateway build version, set at link time via
+//
+//	-ldflags "-X main.version=$(git describe --tags --always)".
+//
+// It defaults to "dev" for a plain `go build` and is reported on /healthz and
+// /stats so an operator can tell which build is running (FR-004).
+var version = "dev"
+
 func main() {
 	// -healthz is the container healthcheck probe: the distroless image has no
 	// shell or curl/wget, so the binary probes its own /healthz and exits 0/1.
@@ -29,9 +55,15 @@ func main() {
 		os.Exit(healthCheck())
 	}
 
+	// Structured JSON logs to stderr, machine-parseable and correlatable by the
+	// delivery ID attached per-request downstream (FR-001). The default logger
+	// is shared by every package via slog.Default().
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("config load failed", "err", err)
+		os.Exit(1)
 	}
 
 	gh := github.New(cfg.GitHubToken, cfg.GitHubAPIBase)
@@ -44,10 +76,10 @@ func main() {
 	if !cfg.ThresholdFromEnv {
 		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if h, err := tr.FetchHealth(hctx); err != nil {
-			log.Printf("threshold: model healthz unavailable (%v); using default %.2f", err, cfg.ConfidenceThreshold)
+			slog.Warn("model healthz unavailable; using default threshold", "err", err, "threshold", cfg.ConfidenceThreshold)
 		} else if h.Threshold > 0 {
 			cfg.ConfidenceThreshold = h.Threshold
-			log.Printf("threshold: sourced %.2f from model artifact %q", h.Threshold, h.Artifact)
+			slog.Info("threshold sourced from model artifact", "threshold", h.Threshold, "artifact", h.Artifact)
 		}
 		hcancel()
 	}
@@ -58,8 +90,12 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", verify.Middleware(cfg.WebhookSecret, cfg.MaxBodyBytes, handler))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		writeJSON(w, map[string]string{"status": "ok", "version": version})
+	})
+	// /stats reports operational counters + triage latency (FR-003). It needs no
+	// secret and exposes no PR content — counts and timings only.
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, statsWithVersion{Snapshot: handler.Stats(), Version: version})
 	})
 
 	srv := &http.Server{
@@ -79,21 +115,28 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		stop() // restore default signal handling; a second signal now aborts
-		log.Print("shutdown: draining...")
+		slog.Info("shutdown: draining")
 
 		shutCtx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutCtx); err != nil {
-			log.Printf("http shutdown: %v", err)
+			slog.Error("http shutdown", "err", err)
 		}
 		if err := handler.Shutdown(shutCtx); err != nil {
-			log.Printf("worker drain: %v", err)
+			slog.Error("worker drain", "err", err)
 		}
 	}()
 
-	log.Printf("sentinel listening on :%s (threshold=%.2f, label=%q)", cfg.Port, cfg.ConfidenceThreshold, cfg.SlopLabel)
+	slog.Info("sentinel listening",
+		"port", cfg.Port,
+		"threshold", cfg.ConfidenceThreshold,
+		"label", cfg.SlopLabel,
+		"shadow_mode", cfg.ShadowMode,
+		"version", version,
+	)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server: %v", err)
+		slog.Error("server", "err", err)
+		os.Exit(1)
 	}
 }
 
@@ -108,12 +151,12 @@ func healthCheck() int {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get("http://127.0.0.1:" + port + "/healthz")
 	if err != nil {
-		log.Printf("healthz probe: %v", err)
+		slog.Error("healthz probe", "err", err)
 		return 1
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("healthz probe: status %d", resp.StatusCode)
+		slog.Error("healthz probe", "status", resp.StatusCode)
 		return 1
 	}
 	return 0

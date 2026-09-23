@@ -19,6 +19,29 @@ import (
 // slop/legit verdict.
 const maxDiffBytes = 50 * 1024
 
+// correlationHeader carries the gateway's per-delivery correlation ID to the
+// model service so a single PR's journey is traceable across both services
+// (FR-002).
+const correlationHeader = "X-Correlation-ID"
+
+// ctxKey is an unexported context key type so values never collide with keys
+// set by other packages.
+type ctxKey int
+
+const correlationKey ctxKey = 0
+
+// WithCorrelationID returns a context carrying id, which Analyze forwards to the
+// model service as the X-Correlation-ID header.
+func WithCorrelationID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, correlationKey, id)
+}
+
+// correlationID extracts a correlation ID set by WithCorrelationID, or "".
+func correlationID(ctx context.Context) string {
+	id, _ := ctx.Value(correlationKey).(string)
+	return id
+}
+
 // Result is the model's verdict, matching the /predict response contract.
 type Result struct {
 	IsSlop     bool    `json:"is_slop"`
@@ -95,6 +118,9 @@ func (c *Client) Analyze(ctx context.Context, title, diff string) (*Result, erro
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if id := correlationID(ctx); id != "" {
+		req.Header.Set(correlationHeader, id)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

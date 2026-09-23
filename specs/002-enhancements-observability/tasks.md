@@ -34,9 +34,15 @@ service (`model/`), offline ML (`ml/`), compose + CI at root.
 
 **Purpose**: Confirm the 001 baseline before layering enhancements.
 
-- [ ] T001 Baseline check: `go build ./...`, `go vet ./...`, `go test ./...`, and
+- [x] T001 Baseline check: `go build ./...`, `go vet ./...`, `go test ./...`, and
   `docker compose config` all green; confirm 001's async pipeline + dedup ledger
   are present (this feature builds on them). Record results.
+  <!-- 2026-09-22: baseline green. go build ./... OK; go vet ./... OK; go test
+  ./... -race all pass (config, github, triage, verify, webhook cached-ok);
+  docker compose config VALID (with env set). 001 async pipeline present
+  (internal/webhook/webhook.go worker pool + fresh 45s ctx) and dedup ledger
+  present (internal/webhook/dedupe.go). No 002 markers on disk yet — clean start. -->
+
 
 ---
 
@@ -44,14 +50,24 @@ service (`model/`), offline ML (`ml/`), compose + CI at root.
 
 **Purpose**: Config flags US1/US2/US3 read.
 
-- [ ] T002 [P] Extend `internal/config/config.go`: add `SHADOW_MODE` (bool, default
+- [x] T002 [P] Extend `internal/config/config.go`: add `SHADOW_MODE` (bool, default
   false), `MODEL_THREADS` (int, default 4, range 1–64, passed to the model service),
   `GITHUB_MAX_RETRIES` (int, default 2, range 0–5), and `BUILD_VERSION` (string, set
   via `-ldflags -X`); extend `internal/config/config_test.go` with parse/validation
   cases (bad bool, out-of-range int).
-- [ ] T003 [P] Add a version variable to `cmd/sentinel/main.go` (`var version = "dev"`)
+  <!-- 2026-09-22: added ShadowMode, ModelThreads, GitHubMaxRetries to Config +
+  Load() with a shared envInt helper (range-validated). BUILD_VERSION is carried
+  as `var version` in main.go via -ldflags -X (T003), not an env var — a build
+  stamp is not runtime config. Tests: TestLoadShadowMode (bad bool),
+  TestLoadModelThreads + TestLoadGitHubMaxRetries (out-of-range int), defaults
+  asserted in TestLoadDefaults. go test ./internal/config green. -->
+- [x] T003 [P] Add a version variable to `cmd/sentinel/main.go` (`var version = "dev"`)
   set at build time with `-ldflags "-X main.version=$(git describe --tags --always)"`;
   document the build flag in the README quickstart.
+  <!-- 2026-09-22: added `var version = "dev"` to main.go; verified injection with
+  `go build -ldflags "-X main.version=test123"`. README "Build version" subsection
+  documents the flag. Reported on /healthz + /stats in T006. -->
+
 
 **Checkpoint**: Config + version compile and pass tests.
 
@@ -66,26 +82,68 @@ endpoint, and reported build version.
 delivery ID (and no diff/secret), the ID reaches the model log, and stats counters
 advance.
 
-- [ ] T004 [US1] Replace `log.Printf` with `log/slog` (stdlib, JSON handler) across
+- [x] T004 [US1] Replace `log.Printf` with `log/slog` (stdlib, JSON handler) across
   `cmd/sentinel/main.go`, `internal/webhook/webhook.go`, `internal/github/github.go`,
   `internal/triage/triage.go`; attach a per-delivery logger carrying the
   `X-GitHub-Delivery` ID (generate a fallback ID when absent). Ensure the diff body,
   token, and secret are never logged (FR-001, FR-002).
-- [ ] T005 [US1] `internal/triage/triage.go`: send the correlation ID to the model
+  <!-- 2026-09-22: main.go installs slog JSON handler as the default; all
+  log.Printf/Fatalf → slog (config-load + server-fatal now slog.Error + os.Exit).
+  webhook.process/act build a per-delivery `slog.With("delivery", id, owner, repo,
+  pr)` logger; only safe fields logged (author, title, is_slop, confidence, err) —
+  never the diff body, token, or secret. github.go/triage.go had NO log calls (they
+  surface errors to webhook, which logs them under the delivery logger), so nothing
+  to replace there. Fallback-ID note: a pull_request event missing X-GitHub-Delivery
+  is rejected 400 (001 trust-boundary behavior, TestMissingDeliveryIDRejected) rather
+  than fabricating an ID — process only ever runs with a non-empty delivery ID, so no
+  generator is dead-added. go build/vet/test all green. -->
+- [x] T005 [US1] `internal/triage/triage.go`: send the correlation ID to the model
   service on `/predict` (e.g. an `X-Correlation-ID` header); `model/app.py` +
   `model/inference.py`: read it and include it in the model's structured log line for
   that request (FR-002).
-- [ ] T006 [US1] Add a stats collector using `sync/atomic` counters (received,
+  <!-- 2026-09-22: triage.go adds WithCorrelationID(ctx,id) + unexported ctxKey;
+  Analyze sets the X-Correlation-ID header when present. webhook.worker stamps
+  j.deliveryID onto the worker ctx via triage.WithCorrelationID. app.py /predict
+  reads `x_correlation_id: str = Header(default="")` and logs it (correlation_id)
+  on the verdict line; missing header → "-", never fails. inference.py needs no
+  change (it has no request-scoped logging). -->
+  <!-- NOTE: model structured (JSON) logging + version-on-/healthz (T007) landed
+  here too, same file (model/app.py) — see T007 for details. -->
+
+- [x] T006 [US1] Add a stats collector using `sync/atomic` counters (received,
   triaged, flagged, skipped, failed) + a simple latency summary; increment it at the
   pipeline stages in `internal/webhook/webhook.go`; expose `GET /stats` (JSON) and the
   build version on `/healthz` in `cmd/sentinel/main.go` (FR-003, FR-004). New file:
   `internal/webhook/stats.go` (+ `stats_test.go`).
-- [ ] T007 [US1] `model/app.py`: switch to structured logging and report the model
+  <!-- 2026-09-22: new internal/webhook/stats.go — Stats with sync/atomic.Int64
+  counters (received/triaged/flagged/skipped/failed) + latency sum/count/max for a
+  mean_ms/max_ms/samples summary; lock-free CAS loop for max. Handler gains a Stats
+  field + Stats() Snapshot accessor. process() increments incReceived (enqueue),
+  incFailed (diff/model error), incSkipped (verdict not actionable), incFlagged
+  (acted) and observeLatency around fetch+model. main.go: /healthz now JSON
+  {status,version}; new /stats → statsWithVersion{Snapshot, version} via writeJSON
+  helper. stats_test.go: zero-snapshot, counter semantics, latency mean/max, and a
+  -race concurrent-increment test. README curl comments updated. -->
+
+- [x] T007 [US1] `model/app.py`: switch to structured logging and report the model
   build/artifact version on `/healthz` (FR-004).
-- [ ] T008 [US1] Tests: `internal/webhook/webhook_test.go` (or a new `stats_test.go`)
+  <!-- 2026-09-22: app.py replaces basicConfig with a stdlib _JSONFormatter
+  (StreamHandler, force=True) emitting {time, level, logger, msg} plus a safe-fields
+  allowlist (correlation_id, is_slop, confidence) — never the diff. /healthz now
+  reports "version" from MODEL_VERSION env (default "dev"); "artifact" already
+  reported. py_compile green. -->
+
+- [x] T008 [US1] Tests: `internal/webhook/webhook_test.go` (or a new `stats_test.go`)
   assert counters advance correctly across flagged/skipped/failed paths and that a
   processed delivery's log carries the delivery ID; assert no secret/diff leaks into
   the captured log output (SC-001, SC-003).
+  <!-- 2026-09-22: webhook_test.go adds TestStatsAdvanceAcrossPaths (routingGitHub
+  fails one PR number, routingTriager flags title=="slop"; asserts Received=3,
+  Flagged=1, Skipped=1, Failed=1, Triaged=2, TriageSamples=2) and
+  TestLogsCarryDeliveryIDAndNeverLeakDiff (captureLogs redirects slog to a
+  mutex-guarded syncBuffer; asserts the delivery ID is present and the diff marker
+  is absent). All webhook tests green under -race. -->
+
 
 **Checkpoint**: A single PR is traceable end to end; stats reflect reality.
 

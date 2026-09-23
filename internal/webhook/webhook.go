@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -92,11 +92,16 @@ type Handler struct {
 	triager Triager
 
 	ledger    *Ledger
+	stats     Stats
 	jobs      chan job
 	wg        sync.WaitGroup
 	startOnce sync.Once
 	stopOnce  sync.Once
 }
+
+// Stats returns a point-in-time snapshot of the operational counters for the
+// /stats endpoint (FR-003).
+func (h *Handler) Stats() Snapshot { return h.stats.Snapshot() }
 
 // New builds a webhook handler. Call Start to launch the worker pool before
 // serving, and Shutdown to drain it on exit.
@@ -144,11 +149,13 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 }
 
 // worker consumes jobs until the queue is closed, running each on a fresh,
-// bounded context so triage outlives the acked HTTP connection.
+// bounded context so triage outlives the acked HTTP connection. The delivery ID
+// rides on the context so the model call carries the same correlation ID (FR-002).
 func (h *Handler) worker() {
 	defer h.wg.Done()
 	for j := range h.jobs {
 		ctx, cancel := context.WithTimeout(context.Background(), triageTimeout)
+		ctx = triage.WithCorrelationID(ctx, j.deliveryID)
 		h.process(ctx, j)
 		cancel()
 	}
@@ -228,38 +235,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// larger buffer or backpressure with a 503 (which GitHub would redeliver).
 	select {
 	case h.jobs <- j:
+		h.stats.incReceived()
 		writeOK(w, "accepted")
 	default:
-		log.Printf("queue full; dropped %s/%s#%d [delivery %s]", j.owner, j.repo, j.number, deliveryID)
+		slog.Warn("queue full; job dropped",
+			"delivery", deliveryID, "owner", j.owner, "repo", j.repo, "pr", j.number)
 		writeOK(w, "queue full; skipped")
 	}
 }
 
 // process runs stages 3-5 for one accepted job on a worker goroutine. Every
-// failure path is fail-open (log + return, PR untouched).
+// failure path is fail-open (log + return, PR untouched). A per-delivery logger
+// carries the correlation ID onto every line so a single PR's journey is
+// traceable end to end (FR-002); the diff body is never logged (FR-001).
 func (h *Handler) process(ctx context.Context, j job) {
-	log.Printf("triaging %s/%s#%d by %s [delivery %s]: %q", j.owner, j.repo, j.number, j.author, j.deliveryID, j.title)
+	lg := slog.With(
+		"delivery", j.deliveryID,
+		"owner", j.owner, "repo", j.repo, "pr", j.number,
+	)
+	lg.Info("triaging", "author", j.author, "title", j.title)
 
-	// Stage 3: fetch diff.
+	// Stage 3: fetch diff. The latency clock spans the fetch + model call so the
+	// summary reflects real end-to-end triage cost.
+	start := time.Now()
 	diff, err := h.gh.FetchDiff(ctx, j.owner, j.repo, j.number)
 	if err != nil {
-		log.Printf("fetch diff failed for %s/%s#%d: %v", j.owner, j.repo, j.number, err)
+		h.stats.incFailed()
+		lg.Error("fetch diff failed; failing open", "err", err)
 		return
 	}
 
 	// Stage 4: triage.
 	res, err := h.triager.Analyze(ctx, j.title, diff)
 	if err != nil {
-		log.Printf("triage failed for %s/%s#%d: %v", j.owner, j.repo, j.number, err)
+		h.stats.incFailed()
+		lg.Error("triage failed; failing open", "err", err)
 		return
 	}
-	log.Printf("verdict %s/%s#%d: is_slop=%t confidence=%.2f", j.owner, j.repo, j.number, res.IsSlop, res.Confidence)
+	h.stats.observeLatency(time.Since(start))
+	lg.Info("verdict", "is_slop", res.IsSlop, "confidence", res.Confidence)
 
 	// Stage 5: act only on high-confidence slop. Never auto-close.
 	if !res.IsSlop || res.Confidence < h.cfg.ConfidenceThreshold {
+		h.stats.incSkipped()
 		return
 	}
-	h.act(ctx, j.owner, j.repo, j.number, res)
+	h.stats.incFlagged()
+
+	// Shadow mode: the full pipeline ran and produced a flag, but we write
+	// nothing outward — log the would-be action and stop. Lets an operator
+	// observe verdicts on real traffic before Sentinel ever speaks (FR-005).
+	if h.cfg.ShadowMode {
+		lg.Info("shadow mode: would flag (no label/comment written)",
+			"confidence", res.Confidence, "reason", res.Reason)
+		return
+	}
+	h.act(ctx, lg, j.owner, j.repo, j.number, res)
 }
 
 // isBot reports whether a GitHub login is a bot account. GitHub App bots carry
@@ -270,12 +301,12 @@ func isBot(login string) bool {
 
 // act applies the label then posts the comment. Errors are logged, not fatal:
 // a successful label with a failed comment is still useful.
-func (h *Handler) act(ctx context.Context, owner, repo string, num int, res *triage.Result) {
+func (h *Handler) act(ctx context.Context, lg *slog.Logger, owner, repo string, num int, res *triage.Result) {
 	if err := h.gh.AddLabel(ctx, owner, repo, num, h.cfg.SlopLabel); err != nil {
-		log.Printf("add label failed for %s/%s#%d: %v", owner, repo, num, err)
+		lg.Error("add label failed", "err", err)
 	}
 	if err := h.gh.PostComment(ctx, owner, repo, num, comment(res.Reason)); err != nil {
-		log.Printf("post comment failed for %s/%s#%d: %v", owner, repo, num, err)
+		lg.Error("post comment failed", "err", err)
 	}
 }
 

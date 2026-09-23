@@ -1,39 +1,66 @@
 # 🛡️ Sentinel — AI-Slop Triage Engine
 
 <p align="center">
-  <b>A Go webhook microservice that intercepts GitHub Pull Requests, sends the diff to Gemini AI for slop detection, and automatically labels + comments on flagged PRs — without ever auto-closing.</b>
+  <b>A two-service system that intercepts GitHub Pull Requests, scores each diff with a self-hosted model, and labels + comments on low-effort "slop" — without ever auto-closing.</b>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Go-1.26.5-00ADD8?logo=go" />
-  <img src="https://img.shields.io/badge/Gemini-2.5_Flash-4285F4?logo=google" />
-  <img src="https://img.shields.io/badge/Docker-Distroless-2496ED?logo=docker" />
+  <img src="https://img.shields.io/badge/Go-1.26-00ADD8?logo=go" />
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python" />
+  <img src="https://img.shields.io/badge/Model-CodeBERT_(self--hosted)-FF6F00" />
+  <img src="https://img.shields.io/badge/Docker-Compose_(distroless_gateway)-2496ED?logo=docker" />
   <img src="https://img.shields.io/badge/GitHub_Webhooks-REST_v3-black?logo=github" />
-  <img src="https://img.shields.io/badge/Dependencies-Zero_(stdlib_only)-brightgreen" />
+  <img src="https://img.shields.io/badge/Gateway_deps-Zero_(stdlib_only)-brightgreen" />
 </p>
 
 ---
 
 ## 📖 Overview
 
-**Sentinel** is a lightweight, production-ready Go microservice that acts as an automated gatekeeper for open-source repositories. It listens for GitHub `pull_request` webhook events, fetches the PR diff via the GitHub REST API, and submits it to **Google Gemini 2.5 Flash** for AI-powered triage.
+**Sentinel** triages GitHub pull requests for low-effort, superficial "slop"
+using two cooperating services:
 
-If Gemini determines the PR is low-effort AI-generated "slop" with confidence above a configurable threshold, Sentinel applies a label (`needs-human-review`) and posts a polite comment on the PR — keeping a human in the loop at all times. It **never auto-closes** a PR.
+- **Gateway** — a single static **Go** binary (zero third-party dependencies,
+  pure stdlib). It verifies the webhook HMAC, acknowledges GitHub in well under
+  a second, and runs triage asynchronously on a worker pool.
+- **Model service** — a **Python / FastAPI** wrapper around a fine-tuned
+  **CodeBERT** classifier that runs entirely **self-hosted** (CPU-only). No
+  external AI API is ever called from the serving path.
 
-The entire service is a single static Go binary with **zero third-party dependencies** (one exception: the Gemini SDK). It ships as a **distroless Docker image** under 20MB.
+When the model scores a PR as slop with confidence above the operating
+threshold, Sentinel applies a label (`needs-human-review`) and posts a polite
+comment — a human always stays in the loop. It **never auto-closes** a PR.
+
+The gateway ships as a **distroless** image; the model service runs non-root
+with a read-only rootfs. The two talk over the internal Compose network only —
+the model port is never published.
 
 ---
 
 ## ✨ Features
 
-- 🔐 **HMAC-SHA256 signature verification** — constant-time validation of `X-Hub-Signature-256` on every webhook request; mismatches return `401` and are dropped immediately
-- 🤖 **Gemini 2.5 Flash triage** — sends PR diff + title to Gemini with a strict JSON schema; returns `{ is_slop, confidence, reason }`
-- 🏷️ **Auto-label** — applies a configurable label to flagged PRs (default: `needs-human-review`)
-- 💬 **Auto-comment** — posts a polite, human-readable explanation on flagged PRs
-- ⚖️ **Confidence threshold** — only acts when `confidence >= CONFIDENCE_THRESHOLD` (default `0.90`); low-confidence verdicts are no-ops
-- 🚫 **Fail-open** — if the AI call fails, Sentinel logs the error and responds `200` without touching the PR
-- 🐳 **Distroless image** — `gcr.io/distroless/static:nonroot`, non-root, <20MB, includes CA certs for HTTPS
-- ✅ **Zero-network tests** — full pipeline tested with `httptest` fake servers; no live credentials required
+- 🔐 **HMAC-SHA256 signature verification** — constant-time check of
+  `X-Hub-Signature-256` over the raw body, before any parsing or work; mismatch → `401`.
+- ⚡ **Fast ack, async triage** — the handler validates, dedups, enqueues, and
+  returns `200` immediately; diff fetch + scoring + writes run on a background
+  worker pool with a fresh 45s context, never the request context.
+- 🧠 **Self-hosted model** — PR title + diff are POSTed to the internal model
+  service `/predict`; returns `{ is_slop, confidence, reason }`. No third-party AI API.
+- 🏷️ **Auto-label + 💬 auto-comment** — configurable label and a human-readable
+  explanation on flagged PRs.
+- 🎚️ **Artifact-sourced threshold** — the operating confidence threshold comes
+  from the trained artifact's `/healthz` (validation-selected), with a `0.95`
+  fallback; overridable via `CONFIDENCE_THRESHOLD`.
+- 🔁 **Idempotent** — a bounded delivery-ID ledger makes a redelivered
+  `X-GitHub-Delivery` a no-op (exactly one label + comment).
+- 🤖 **Bot + event gating** — non-`pull_request` events and `[bot]` authors are
+  acked with zero API calls.
+- 🚫 **Fail-open** — any downstream error (diff fetch, model 5xx/timeout,
+  label/comment post) → `200` and the PR is left untouched.
+- 🛡️ **Hardened containers** — distroless gateway, non-root, `cap_drop: ALL`,
+  `no-new-privileges`, read-only rootfs, resource limits.
+- ✅ **Zero-network tests** — the full pipeline is covered with `httptest`
+  fakes; no live credentials required.
 
 ---
 
@@ -43,33 +70,33 @@ The entire service is a single static Go binary with **zero third-party dependen
 GitHub PR opened / reopened / synchronized
         │  HTTP POST  (pull_request event)
         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  POST /webhook                                               │
-│                                                             │
-│  1. HMAC middleware  (internal/verify)                      │
-│     HMAC-SHA256(body, WEBHOOK_SECRET) vs X-Hub-Signature-256│
-│     Mismatch → 401, drop.                                   │
-│                                                             │
-│  2. Parse payload  (internal/webhook)                       │
-│     action == "opened" | "reopened" | "synchronize" only    │
-│     extract owner, repo, PR number, title, author           │
-│                                                             │
-│  3. Fetch diff  (internal/github)                           │
-│     GET /repos/{owner}/{repo}/pulls/{n}                     │
-│     Accept: application/vnd.github.v3.diff                  │
-│                                                             │
-│  4. Triage  (internal/triage)                               │
-│     diff + title → gemini-2.5-flash                        │
-│     returns { is_slop: bool, confidence: float, reason }    │
-│                                                             │
-│  5. Act  (internal/github)                                  │
-│     if is_slop && confidence >= threshold:                  │
-│       → POST label: "needs-human-review"                   │
-│       → POST comment: polite explanation                    │
-│     else: no-op                                             │
-│                                                             │
-│  Respond 200. Never auto-close.                             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────── Gateway (Go, stdlib) ────────────────────────────┐
+│  POST /webhook                                                               │
+│                                                                              │
+│  1. Body-size cap  (internal/verify)   oversized → 413, no HMAC work         │
+│  2. HMAC verify    (internal/verify)   HMAC-SHA256(body, secret) mismatch→401 │
+│  3. Gate           (internal/webhook)  event==pull_request, action opened/   │
+│                                        reopened/synchronize, skip [bot],      │
+│                                        dedup X-GitHub-Delivery                │
+│  4. Enqueue + ACK 200  ── returns immediately (< 1s) ─────────────────────┐  │
+│                                                                           │  │
+│  ── worker pool (WORKER_COUNT), fresh context.Background()+45s ───────────┘  │
+│  5. Fetch diff     (internal/github)   GET pulls/{n}, Accept: …diff           │
+│  6. Triage         (internal/triage)   POST {MODEL_URL}/predict ───────────┐  │
+│  7. Act            (internal/github)   if is_slop && conf ≥ threshold:      │  │
+│                                          → add label + post comment         │  │
+│                                        else / any error: no-op (fail-open)  │  │
+└─────────────────────────────────────────────────────────────────────────┼──┘
+                                                                            ▼
+                                            ┌──── Model service (Python) ────┐
+                                            │  POST /predict → {is_slop,      │
+                                            │    confidence, reason}          │
+                                            │  GET  /healthz → {status,       │
+                                            │    threshold, artifact}         │
+                                            │  Fine-tuned CodeBERT, CPU-only  │
+                                            └─────────────────────────────────┘
+
+Respond 200. Never auto-close.
 ```
 
 ---
@@ -78,33 +105,48 @@ GitHub PR opened / reopened / synchronized
 
 ```
 Sentinel-AI-Slop-Triage-Engine/
-├── cmd/sentinel/main.go     # Entry point: config load, wiring, ListenAndServe, /healthz
+├── cmd/sentinel/main.go     # Entry: config, worker pool, server, graceful shutdown, -healthz
 ├── internal/
 │   ├── config/              # Env-var config load & validation
-│   ├── verify/              # HMAC-SHA256 constant-time middleware
-│   ├── webhook/             # Payload parsing + pipeline orchestration
+│   ├── verify/              # HMAC-SHA256 middleware + body-size cap (413)
+│   ├── webhook/             # Gate + ack + async worker pool; dedupe.go ledger
 │   ├── github/              # REST client: fetch diff, add label, post comment
-│   └── triage/              # Gemini client + JSON schema + prompt
-├── deploy/
-│   └── Dockerfile           # Multi-stage build → distroless static:nonroot
-├── go.mod                   # Zero third-party dependencies (pure stdlib)
-└── PROJECT_MAP.md           # Architecture reference & design decisions
+│   └── triage/              # Model client: POST /predict, GET /healthz
+├── model/                   # Self-hosted inference service
+│   ├── app.py               # FastAPI: /predict, /healthz
+│   ├── inference.py         # CodeBERT classifier + artifact/threshold loading
+│   └── Dockerfile           # CPU-only torch, non-root
+├── ml/                      # Offline training pipeline (never in serving path)
+│   ├── collect_prs.py       # Gather PRs → raw dataset
+│   ├── build_dataset.py     # Leakage-free splits + synthetic slop
+│   ├── train.py             # Fine-tune + validation threshold selection
+│   ├── evaluate.py          # Test-set precision gate (≥ 0.85)
+│   └── tests/               # Offline self-checks (stdlib + numpy)
+├── deploy/Dockerfile        # Gateway → distroless static:nonroot
+├── docker-compose.yml       # Two-service stack
+├── .env.example             # Config template
+├── .specify/memory/constitution.md   # 8 project principles
+├── specs/                   # Feature specs, plans, tasks
+└── PROJECT_MAP.md           # Architecture reference & design history
 ```
 
 ---
 
 ## ⚙️ Configuration
 
-All configuration is via environment variables — no config files.
+All configuration is via environment variables — no config files ship in the
+image. Copy `.env.example` → `.env` and fill in the required values.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GITHUB_WEBHOOK_SECRET` | ✅ | — | Shared secret for HMAC-SHA256 signature verification |
-| `GITHUB_TOKEN` | ✅ | — | PAT or GitHub App token — used to fetch diffs, write labels and comments |
-| `GEMINI_API_KEY` | ✅ | — | Google AI Studio / Vertex AI API key for Gemini |
-| `CONFIDENCE_THRESHOLD` | ❌ | `0.90` | Minimum Gemini confidence score (0–1) to trigger label + comment |
-| `SLOP_LABEL` | ❌ | `needs-human-review` | Name of the GitHub label applied to flagged PRs |
-| `PORT` | ❌ | `8080` | HTTP listen port |
+| `GITHUB_TOKEN` | ✅ | — | PAT or GitHub App token — fetch diffs, write labels & comments |
+| `MODEL_URL` | ✅ | `http://sentinel-model:9000` | Base URL of the self-hosted model service |
+| `CONFIDENCE_THRESHOLD` | ❌ | artifact value (`0.95` fallback) | Min confidence to act; sourced from the model artifact via `/healthz` when unset |
+| `SLOP_LABEL` | ❌ | `needs-human-review` | Label applied to flagged PRs |
+| `PORT` | ❌ | `8080` | Gateway HTTP listen port |
+| `MAX_BODY_BYTES` | ❌ | `26214400` (25 MiB) | Max webhook body size; oversized → `413` before HMAC |
+| `WORKER_COUNT` | ❌ | `8` | Background triage worker-pool size (1–64) |
 
 ---
 
@@ -112,74 +154,105 @@ All configuration is via environment variables — no config files.
 
 ### Prerequisites
 
-- **Go 1.22+** (tested on 1.26.5)
-- A **GitHub repository** with a configured webhook (see below)
-- A **Gemini API key** ([Google AI Studio](https://aistudio.google.com/))
-- A **GitHub Personal Access Token** with `repo` scope (or a GitHub App)
+- **Docker** + **Docker Compose** (the recommended path — runs both services)
+- A trained model artifact at `model/model/` (see [Training](#-training) — or
+  copy one produced offline)
+- **Go 1.26** if you want to run the gateway or tests from source
+- A **GitHub repository** with a configured webhook and a token with
+  Pull requests: read/write, Issues: read/write
 
----
-
-### Option A — Docker (Recommended)
-
-```bash
-# Build the image
-docker build -f deploy/Dockerfile -t sentinel .
-
-# Run
-docker run -p 8080:8080 \
-  -e GITHUB_WEBHOOK_SECRET=your_secret \
-  -e GITHUB_TOKEN=ghp_xxxx \
-  -e GEMINI_API_KEY=AIza_xxxx \
-  -e CONFIDENCE_THRESHOLD=0.90 \
-  sentinel
-```
-
-### Option B — Run from source
+### Quickstart (Docker Compose)
 
 ```bash
-git clone https://github.com/Bechir-afk/Sentinel-AI-Slop-Triage-Engine.git
-cd Sentinel-AI-Slop-Triage-Engine
+cp .env.example .env          # then fill in GITHUB_WEBHOOK_SECRET + GITHUB_TOKEN
 
-export GITHUB_WEBHOOK_SECRET=your_secret
-export GITHUB_TOKEN=ghp_xxxx
-export GEMINI_API_KEY=AIza_xxxx
-
-go run ./cmd/sentinel
+# 1. Artifact present → both services reach healthy
+docker compose up -d
+docker compose ps
+curl localhost:8080/healthz   # → {"status":"ok","version":"dev"}
+curl localhost:8080/stats     # → {"received":…,"triaged":…,"flagged":…,…,"version":"dev"}
 ```
 
-### Option C — Build binary
+If the model artifact is **missing**, the model service exits with a single
+actionable line (naming the path and the command that produces it) instead of
+crash-looping — and the gateway still starts and fails open:
 
 ```bash
-go build -o sentinel ./cmd/sentinel
-./sentinel
+rm -rf model/model
+docker compose up sentinel-model
+docker compose logs sentinel-model | tail -3   # one clear error, container exits
 ```
-
----
 
 ### Configure the GitHub Webhook
 
-1. Go to your repo → **Settings → Webhooks → Add webhook**
-2. Set **Payload URL** to `https://your-host:8080/webhook`
-3. Set **Content type** to `application/json`
-4. Set **Secret** to the same value as `GITHUB_WEBHOOK_SECRET`
-5. Select **Let me select individual events** → check **Pull requests**
-6. Click **Add webhook**
+1. Repo → **Settings → Webhooks → Add webhook**
+2. **Payload URL**: `https://your-host:8080/webhook`
+3. **Content type**: `application/json`
+4. **Secret**: the same value as `GITHUB_WEBHOOK_SECRET`
+5. **Let me select individual events** → check **Pull requests**
+6. **Add webhook**
 
-Sentinel also exposes a **health check** at `GET /healthz` → `200 OK`.
+The gateway exposes `GET /healthz` → `200 ok` for the Compose healthcheck.
+
+### Build version (source builds)
+
+The gateway reports a build version on `/healthz` and `/stats`. A plain
+`go build` reports `dev`; stamp a real version at link time:
+
+```bash
+go build -ldflags "-X main.version=$(git describe --tags --always)" ./cmd/sentinel
+```
+
+---
+
+## 🧠 Training
+
+The model artifact is produced **offline** by the `ml/` pipeline and mounted
+read-only into the model service (`model/model/`). Nothing here runs in the
+serving path.
+
+```bash
+cd ml
+pip install -r requirements.txt
+
+python collect_prs.py     # gather PRs → raw dataset
+python build_dataset.py   # leakage-free train/val/test splits (+ synthetic slop);
+                          #   asserts zero cross-split (title, diff) collisions
+python train.py           # fine-tune CodeBERT; sweeps the validation split and
+                          #   writes threshold.json (lowest cutoff clearing 0.85 precision)
+python evaluate.py        # scores the test set at the selected threshold;
+                          #   exits non-zero if SLOP precision < 0.85
+```
+
+`train.py` writes the artifact (config, weights, tokenizer) plus
+`threshold.json` — the model service loads both and exposes the threshold on
+`/healthz`, which the gateway uses as its default operating threshold.
+
+Offline invariants have fast, dependency-light self-checks (stdlib + numpy, no
+torch):
+
+```bash
+python ml/tests/test_build_dataset.py   # leakage assertion
+python ml/tests/test_thresholds.py      # threshold selection + softmax
+```
 
 ---
 
 ## 🧪 Running Tests
 
 ```bash
-go test ./...
+go build ./...          # compile check
+go vet ./...            # static analysis
+go test ./... -race     # full suite, race detector
 ```
 
-All tests use `httptest` fake servers — **no live GitHub or Gemini credentials required**. The full pipeline (HMAC verify → parse → fetch diff → triage → label + comment) is covered end-to-end in `internal/webhook/webhook_test.go`.
+All Go tests use `testing` + `net/http/httptest` fakes — **no live GitHub or
+model credentials required**. The async pipeline (gate → ack → worker pool →
+fetch diff → triage → label + comment), dedup, bot skip, body cap, and every
+fail-open path are covered.
 
 ```bash
-go vet ./...    # Static analysis
-go build ./...  # Compile check
+docker compose config   # validate the two-service stack
 ```
 
 ---
@@ -188,23 +261,31 @@ go build ./...  # Compile check
 
 | Layer | Technology | Notes |
 |---|---|---|
-| Language | Go 1.26.5 | Single static binary |
-| HTTP Server | `net/http` (stdlib) | One endpoint — no framework needed |
-| HMAC Verification | `crypto/hmac` + `crypto/sha256` (stdlib) | Constant-time comparison |
-| GitHub API | Plain REST over `net/http` | 3 calls: fetch diff, add label, post comment |
-| AI Inference | Google Gemini 2.5 Flash | Structured JSON output via `ResponseMIMEType` + schema |
-| Container | `gcr.io/distroless/static:nonroot` | <20MB, non-root, includes CA certs |
-| Tests | `testing` + `net/http/httptest` (stdlib) | Zero network required |
-| Dependencies | `google.golang.org/genai` only | Everything else is pure stdlib |
+| Gateway | Go 1.26 | Single static binary, **zero third-party deps** |
+| HTTP server | `net/http` (stdlib) | One endpoint — no framework |
+| HMAC verification | `crypto/hmac` + `crypto/sha256` (stdlib) | Constant-time |
+| GitHub API | Plain REST over `net/http` | fetch diff, add label, post comment |
+| Model service | Python 3.11 · FastAPI · CodeBERT | Self-hosted, CPU-only torch |
+| Gateway container | `gcr.io/distroless/static:nonroot` | Non-root, tiny, CA certs included |
+| Model container | non-root, read-only rootfs + tmpfs | `cap_drop: ALL`, resource-limited |
+| Tests | `testing` + `net/http/httptest` (stdlib) | Zero network |
 
 ---
 
 ## 🎯 Design Decisions
 
-- **No auto-close** — Sentinel labels and comments only. A human always makes the final call to close or merge.
-- **Fail-open** — If the Gemini call fails for any reason, Sentinel logs the error, returns `200` to GitHub, and leaves the PR untouched.
-- **Distroless over scratch** — The `scratch` base image cannot make HTTPS calls (no CA certs). `distroless/static:nonroot` solves this at the same size.
-- **Zero deps** — The GitHub API calls are plain `net/http` REST. Only the Gemini SDK is a third-party dependency.
+- **Never auto-close** — Sentinel labels and comments only. A human always makes
+  the final call to close or merge.
+- **Fail-open** — any downstream failure logs, returns `200`, and leaves the PR
+  untouched. A flaky model never blocks a legitimate contributor.
+- **Ack-then-process** — GitHub gets a sub-second `200`; triage runs on a worker
+  pool with a fresh bounded context, decoupled from the connection.
+- **Self-hosted model** — the serving path never calls an external AI API; the
+  gateway talks to the model over the internal network only.
+- **Precision over recall** — the artifact must clear 0.85 SLOP precision on a
+  leakage-free test set; false positives on real contributors are the expensive error.
+- **Zero Go dependencies** — the gateway is pure stdlib; adding a module requires
+  amending the [constitution](.specify/memory/constitution.md).
 
 ---
 
