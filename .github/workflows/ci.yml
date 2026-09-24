@@ -19,6 +19,12 @@ jobs:
         run: go vet ./...
       - name: test (race)
         run: go test ./... -race
+      # Fail the build on a known Go advisory affecting reachable code (FR-013).
+      # govulncheck is call-graph aware, so it only flags vulns actually reached.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
   ml-selfchecks:
     name: ML offline self-checks
@@ -41,3 +47,19 @@ jobs:
       # verifies the train/serve encoding invariant (SC-006) without torch.
       - name: pair-encoding check
         run: python model/tests/test_inference.py
+
+  dep-audit:
+    name: Python dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Audit the pinned serving + training deps against the advisory DB and fail
+      # on a known vuln (FR-013). Audits the requirement files directly — no need
+      # to install the multi-GB torch stack in CI.
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r model/requirements.txt -r ml/requirements.txt

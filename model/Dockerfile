@@ -1,6 +1,9 @@
 # Python inference service. CPU-only PyTorch is plenty for PR-rate load
 # (see PROJECT_MAP: single 512-token forward pass, sub-second on commodity CPU).
-FROM python:3.11-slim
+# Digest-pinned (FR-012): the tag is for humans, the @sha256 makes the pull
+# reproducible. Refresh both together (`docker buildx imagetools inspect
+# python:3.11-slim`) when bumping the base.
+FROM python:3.11-slim@sha256:da047cb8f9d1d98e5c070f5300ba9f7274e33b8fc0e5be5ed88740aed1b95ba9
 
 WORKDIR /app
 

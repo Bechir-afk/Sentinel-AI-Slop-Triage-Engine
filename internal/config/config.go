@@ -23,6 +23,7 @@ type Config struct {
 	ShadowMode          bool    // SHADOW_MODE — run pipeline, log verdict, write nothing
 	ModelThreads        int     // MODEL_THREADS — model service CPU thread cap (passed through)
 	GitHubMaxRetries    int     // GITHUB_MAX_RETRIES — bounded transient-error retries
+	FeedbackLogPath     string  // FEEDBACK_LOG — append-only maintainer-disagreement log ("" disables it)
 }
 
 // Load reads and validates configuration. Required secrets that are missing
@@ -36,6 +37,7 @@ func Load() (*Config, error) {
 		SlopLabel:           envOr("SLOP_LABEL", "needs-human-review"),
 		Port:                envOr("PORT", "8080"),
 		GitHubAPIBase:       envOr("GITHUB_API_BASE", "https://api.github.com"),
+		FeedbackLogPath:     os.Getenv("FEEDBACK_LOG"), // unset → feedback capture disabled (FR-015)
 		MaxBodyBytes:        25 << 20, // 26214400 (25 MiB); GitHub caps deliveries ~25MB
 		WorkerCount:         8,
 		ModelThreads:        4,

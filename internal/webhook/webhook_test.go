@@ -17,16 +17,20 @@ import (
 	"sentinel/internal/triage"
 )
 
-// fakeGitHub records label/comment calls (concurrency-safe: workers run in
-// their own goroutines) and lets tests inject a diff error.
+// fakeGitHub records label/comment/check-run calls (concurrency-safe: workers
+// run in their own goroutines) and lets tests inject a diff error.
 type fakeGitHub struct {
 	mu          sync.Mutex
 	diff        string
 	diffErr     error
 	labelCount  int
 	commentCnt  int
+	checkCnt    int
 	labelErr    error
 	commentText string
+	checkErr    error
+	checkSHA    string
+	checkConcl  string
 }
 
 func (f *fakeGitHub) FetchDiff(_ context.Context, _, _ string, _ int) (string, error) {
@@ -45,6 +49,14 @@ func (f *fakeGitHub) PostComment(_ context.Context, _, _ string, _ int, body str
 	f.commentText = body
 	return nil
 }
+func (f *fakeGitHub) CreateCheckRun(_ context.Context, _, _, headSHA, conclusion, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkCnt++
+	f.checkSHA = headSHA
+	f.checkConcl = conclusion
+	return f.checkErr
+}
 func (f *fakeGitHub) labels() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -54,6 +66,11 @@ func (f *fakeGitHub) comments() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.commentCnt
+}
+func (f *fakeGitHub) checks() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checkCnt
 }
 func (f *fakeGitHub) comment() string {
 	f.mu.Lock()
@@ -90,7 +107,7 @@ func testConfig() config.Config {
 
 const openedPayload = `{
 	"action":"opened","number":7,
-	"pull_request":{"title":"Add feature","user":{"login":"dev"}},
+	"pull_request":{"title":"Add feature","user":{"login":"dev"},"head":{"sha":"abc123"}},
 	"repository":{"owner":{"login":"octo"},"name":"repo"}
 }`
 
@@ -452,6 +469,9 @@ func TestShadowModeSuppressesWrites(t *testing.T) {
 	if gh.labels() != 0 || gh.comments() != 0 {
 		t.Errorf("shadow mode should write nothing; labels=%d comments=%d", gh.labels(), gh.comments())
 	}
+	if gh.checks() != 0 {
+		t.Errorf("shadow mode should create no check run; checks=%d", gh.checks())
+	}
 	if s := h.Stats(); s.Flagged != 1 {
 		t.Errorf("shadow mode should still run the pipeline and count the flag; Flagged=%d, want 1", s.Flagged)
 	}
@@ -476,5 +496,71 @@ func TestShadowOffPostsCommentWithConfidenceAndVersion(t *testing.T) {
 	}
 	if !strings.Contains(c, "model-2026-09-22") {
 		t.Errorf("comment missing artifact version; got: %q", c)
+	}
+}
+
+// FR-014: a flagged verdict creates an observational Check Run on the PR head
+// alongside the label + comment, with a non-blocking "neutral" conclusion.
+func TestFlaggedCreatesNeutralCheckRun(t *testing.T) {
+	gh := &fakeGitHub{diff: "some diff"}
+	tr := &fakeTriager{res: &triage.Result{IsSlop: true, Confidence: 0.99, Reason: "boilerplate"}}
+	h := newStarted(testConfig(), gh, tr)
+
+	post(t, h, openedPayload)
+	drain(t, h)
+
+	if gh.labels() != 1 || gh.comments() != 1 || gh.checks() != 1 {
+		t.Fatalf("want 1 label+1 comment+1 check; labels=%d comments=%d checks=%d",
+			gh.labels(), gh.comments(), gh.checks())
+	}
+	if gh.checkSHA != "abc123" {
+		t.Errorf("check run head SHA = %q, want the payload head sha %q", gh.checkSHA, "abc123")
+	}
+	if gh.checkConcl != "neutral" {
+		t.Errorf("check run conclusion = %q, want %q (observational, never blocking)", gh.checkConcl, "neutral")
+	}
+}
+
+// FR-014: a Check Run failure fails open and MUST NOT block the label/comment
+// path — those still succeed even when CreateCheckRun errors.
+func TestCheckRunFailureDoesNotBlockLabelComment(t *testing.T) {
+	gh := &fakeGitHub{diff: "some diff", checkErr: errors.New("check-runs API down")}
+	tr := &fakeTriager{res: &triage.Result{IsSlop: true, Confidence: 0.99, Reason: "boilerplate"}}
+	h := newStarted(testConfig(), gh, tr)
+
+	post(t, h, openedPayload)
+	drain(t, h)
+
+	if gh.labels() != 1 || gh.comments() != 1 {
+		t.Errorf("label/comment must be unaffected by a check-run failure; labels=%d comments=%d",
+			gh.labels(), gh.comments())
+	}
+	if gh.checks() != 1 {
+		t.Errorf("check run should have been attempted once; checks=%d", gh.checks())
+	}
+}
+
+// A flagged PR whose payload carries no head SHA skips the Check Run (nothing to
+// attach to) but still labels + comments — fail-open, no fabricated SHA.
+func TestFlaggedWithoutHeadSHASkipsCheckRun(t *testing.T) {
+	gh := &fakeGitHub{diff: "some diff"}
+	tr := &fakeTriager{res: &triage.Result{IsSlop: true, Confidence: 0.99, Reason: "boilerplate"}}
+	h := newStarted(testConfig(), gh, tr)
+
+	// openedPayload without a head.sha field.
+	body := `{
+		"action":"opened","number":7,
+		"pull_request":{"title":"Add feature","user":{"login":"dev"}},
+		"repository":{"owner":{"login":"octo"},"name":"repo"}
+	}`
+	post(t, h, body)
+	drain(t, h)
+
+	if gh.labels() != 1 || gh.comments() != 1 {
+		t.Errorf("label/comment expected even without a head SHA; labels=%d comments=%d",
+			gh.labels(), gh.comments())
+	}
+	if gh.checks() != 0 {
+		t.Errorf("no head SHA → no check run; checks=%d", gh.checks())
 	}
 }

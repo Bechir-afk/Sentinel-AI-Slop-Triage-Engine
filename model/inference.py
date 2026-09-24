@@ -27,11 +27,12 @@ SLOP = 1
 # validation-selected value.
 DEFAULT_THRESHOLD = 0.95
 
-# A usable artifact directory has a model config, a weights file, and tokenizer
-# files. We accept either safetensors or the legacy .bin weights (T017 moves us
-# to safetensors) and any of the RoBERTa/CodeBERT tokenizer layouts.
+# A usable artifact directory has a model config, a safetensors weights file, and
+# tokenizer files. We require safetensors (not the legacy pickle .bin): the model
+# is loaded with use_safetensors=True (FR-011), so a .bin-only artifact can't
+# serve — catch it here with an actionable message rather than a load-time trace.
 _REQUIRED_ANY = {
-    "weights": ("model.safetensors", "pytorch_model.bin"),
+    "weights": ("model.safetensors",),
     "tokenizer": ("tokenizer.json", "vocab.json", "tokenizer_config.json"),
 }
 
@@ -70,7 +71,13 @@ _verify_artifact(MODEL_PATH)
 
 # Loaded once at import; a forward pass reuses these.
 _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+# use_safetensors=True: load model.safetensors only, never unpickle a
+# pytorch_model.bin. An artifact carries weights we did not necessarily produce
+# (it's mounted at MODEL_PATH), so refusing the pickle format closes an
+# arbitrary-code-execution path at load time (FR-011). train.py writes
+# safetensors (save_safetensors=True); a legacy .bin artifact now fails loudly
+# here rather than silently deserializing.
+_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH, use_safetensors=True)
 _model.eval()
 logger.info("loaded model from %s", MODEL_PATH)
 

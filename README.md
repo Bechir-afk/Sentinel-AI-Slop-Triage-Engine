@@ -48,11 +48,22 @@ the model port is never published.
   service `/predict`; returns `{ is_slop, confidence, reason }`. No third-party AI API.
 - 🏷️ **Auto-label + 💬 auto-comment** — configurable label and a human-readable
   explanation on flagged PRs.
+- ✔️ **Observational Check Run** — a `neutral` Check Run posts the verdict in the
+  PR's checks panel alongside the label + comment. Informational only — it never
+  gates or blocks merging, and a Check Run failure can't block the label/comment.
+- 🕶️ **Shadow mode** — `SHADOW_MODE=true` runs the full pipeline and counts the
+  flag but writes nothing outward (no label, comment, or Check Run), so an operator
+  can observe verdicts on live traffic before Sentinel ever speaks.
 - 🎚️ **Artifact-sourced threshold** — the operating confidence threshold comes
   from the trained artifact's `/healthz` (validation-selected), with a `0.95`
   fallback; overridable via `CONFIDENCE_THRESHOLD`.
 - 🔁 **Idempotent** — a bounded delivery-ID ledger makes a redelivered
   `X-GitHub-Delivery` a no-op (exactly one label + comment).
+- ♻️ **Bounded retry** — transient GitHub 5xx/timeout errors are retried
+  (`GITHUB_MAX_RETRIES`, default 2) with backoff; exhausted retries fail open.
+- 📊 **Feedback loop** — a maintainer removing the slop label appends one row to
+  an out-of-band, append-only log (`FEEDBACK_LOG`), written off the request path
+  and read only by the offline `ml/` retraining pipeline. Disabled when unset.
 - 🤖 **Bot + event gating** — non-`pull_request` events and `[bot]` authors are
   acked with zero API calls.
 - 🚫 **Fail-open** — any downstream error (diff fetch, model 5xx/timeout,
@@ -84,7 +95,7 @@ GitHub PR opened / reopened / synchronized
 │  5. Fetch diff     (internal/github)   GET pulls/{n}, Accept: …diff           │
 │  6. Triage         (internal/triage)   POST {MODEL_URL}/predict ───────────┐  │
 │  7. Act            (internal/github)   if is_slop && conf ≥ threshold:      │  │
-│                                          → add label + post comment         │  │
+│                                          → add label + comment + Check Run   │  │
 │                                        else / any error: no-op (fail-open)  │  │
 └─────────────────────────────────────────────────────────────────────────┼──┘
                                                                             ▼
@@ -147,6 +158,10 @@ image. Copy `.env.example` → `.env` and fill in the required values.
 | `PORT` | ❌ | `8080` | Gateway HTTP listen port |
 | `MAX_BODY_BYTES` | ❌ | `26214400` (25 MiB) | Max webhook body size; oversized → `413` before HMAC |
 | `WORKER_COUNT` | ❌ | `8` | Background triage worker-pool size (1–64) |
+| `SHADOW_MODE` | ❌ | `false` | Run the full pipeline and count the flag, but write nothing outward (no label/comment/Check Run) |
+| `GITHUB_MAX_RETRIES` | ❌ | `2` | Bounded retries on transient GitHub errors (0–5); exhausted → fail open |
+| `MODEL_THREADS` | ❌ | `4` | CPU thread cap passed through to the model service (1–64) |
+| `FEEDBACK_LOG` | ❌ | — (disabled) | Path to the append-only maintainer-disagreement log; unset disables feedback capture |
 
 ---
 
@@ -194,6 +209,12 @@ docker compose logs sentinel-model | tail -3   # one clear error, container exit
 
 The gateway exposes `GET /healthz` → `200 ok` for the Compose healthcheck.
 
+> **Feedback loop (optional):** the **Pull requests** event already delivers the
+> `unlabeled` action Sentinel needs — no extra event selection is required. Just
+> set `FEEDBACK_LOG` to enable capture. When a maintainer removes the slop label
+> from a PR Sentinel flagged, one JSON row is appended to that log (off the
+> request path); leaving `FEEDBACK_LOG` unset disables the feature entirely.
+
 ### Build version (source builds)
 
 The gateway reports a build version on `/healthz` and `/stats`. A plain
@@ -227,6 +248,21 @@ python evaluate.py        # scores the test set at the selected threshold;
 `train.py` writes the artifact (config, weights, tokenizer) plus
 `threshold.json` — the model service loads both and exposes the threshold on
 `/healthz`, which the gateway uses as its default operating threshold.
+
+**Closing the feedback loop (FR-016):** the maintainer-disagreement log captured
+by the gateway (`FEEDBACK_LOG`) feeds straight back into retraining. Each removed
+slop label is a human correction — a PR that was *not* slop — so `build_dataset.py`
+folds those rows in as real `LEGIT` examples:
+
+```bash
+# the log is identity-only; fetching the PR title+diff needs a token
+GITHUB_TOKEN=... python build_dataset.py --raw raw_prs.jsonl \
+    --feedback-log /path/to/feedback.jsonl --out dataset
+```
+
+Signals that don't parse (bad PR ref, a diff that no longer fetches, or any
+disagreement type other than `label-removed`) are skipped, never guessed — the
+pipeline never fabricates a label for a PR it can't identify.
 
 Offline invariants have fast, dependency-light self-checks (stdlib + numpy, no
 torch):
@@ -284,6 +320,10 @@ docker compose config   # validate the two-service stack
   gateway talks to the model over the internal network only.
 - **Precision over recall** — the artifact must clear 0.85 SLOP precision on a
   leakage-free test set; false positives on real contributors are the expensive error.
+- **Stateless serving path** — the gateway keeps no per-PR state beyond a bounded
+  in-memory dedup ledger. The one exception is the feedback log, and it is
+  deliberately out-of-band: written off the request path and read only by the
+  offline `ml/` pipeline, so the serving path stays stateless.
 - **Zero Go dependencies** — the gateway is pure stdlib; adding a module requires
   amending the [constitution](.specify/memory/constitution.md).
 

@@ -257,21 +257,54 @@ GitHub 503→503→200 then 503-forever.
 **Independent Test**: quickstart V-sec (artifact load format, crafted owner/repo, CI
 scan on a bad pin).
 
-- [ ] T016 [P] [US4] `internal/github/github.go`: `url.PathEscape` owner and repo in
+- [x] T016 [P] [US4] `internal/github/github.go`: `url.PathEscape` owner and repo in
   every URL builder (`FetchDiff`, `AddLabel`, `PostComment`) (FR-010); add a
   `github_test.go` case with a `/`-bearing owner asserting the escaped path.
-- [ ] T017 [P] [US4] `ml/train.py`: save the artifact as safetensors
+  <!-- 2026-09-23: added an unexported esc(s) = url.PathEscape(s) helper and wrapped
+  owner+repo with it in all three URL builders (FetchDiff/AddLabel/PostComment). The
+  values arrive from the webhook payload (a trust boundary), so a crafted "../" or
+  slash-bearing segment can no longer reshape the REST path. github_test.go adds
+  TestFetchDiffEscapesOwnerRepo (owner "octo/../evil", repo "re po" →
+  /repos/octo%2F..%2Fevil/re%20po/pulls/7). Public method signatures unchanged. Green
+  under -race. -->
+
+- [x] T017 [P] [US4] `ml/train.py`: save the artifact as safetensors
   (`save_model(..., safe_serialization=True)` / ensure `.safetensors` output);
   `model/inference.py`: load with `use_safetensors=True` so no pickle is deserialized
   at serve time (FR-011).
-- [ ] T018 [P] [US4] Pin every base image by digest: `deploy/Dockerfile`
+  <!-- 2026-09-23: ml/train.py sets save_safetensors=True in TrainingArguments — chosen
+  over save_model(..., safe_serialization=True) because it also governs per-epoch
+  checkpoint serialization, not just the final save, so no pickle .bin is ever written.
+  model/inference.py loads with use_safetensors=True (closes the pickle
+  arbitrary-code-execution path at load — the artifact is mounted at MODEL_PATH, i.e.
+  not necessarily ours) AND _REQUIRED_ANY["weights"] is now ("model.safetensors",) only,
+  so a legacy .bin-only artifact fails _verify_artifact with one actionable line instead
+  of load-time deserialization. py_compile green. -->
+- [x] T018 [P] [US4] Pin every base image by digest: `deploy/Dockerfile`
   (`golang:1.26@sha256:…`, `gcr.io/distroless/static:nonroot@sha256:…`) and
   `model/Dockerfile` (`python:3.11-slim@sha256:…`) (FR-012).
-- [ ] T019 [P] [US4] `.github/workflows/ci.yml`: add `govulncheck ./...` (Go) and a
+  <!-- 2026-09-23: all three base images digest-pinned with the tag kept for humans +
+  @sha256 for reproducibility. deploy/Dockerfile: golang:1.26@sha256:6c2a5538… (build),
+  gcr.io/distroless/static:nonroot@sha256:e2e927ec… (runtime). model/Dockerfile:
+  python:3.11-slim@sha256:da047cb8…. Used the MULTI-ARCH INDEX digest (from `docker
+  buildx imagetools inspect`), not the amd64-only manifest digest, so arch selection
+  still works. Each pin carries a comment + a refresh note (`docker buildx imagetools
+  inspect <tag>`) to keep tag and digest in sync on a bump. -->
+- [x] T019 [P] [US4] `.github/workflows/ci.yml`: add `govulncheck ./...` (Go) and a
   Python dependency audit (e.g. `pip-audit -r model/requirements.txt -r
   ml/requirements.txt`); fail the build on a known advisory (FR-013). (Confirm
   `.dockerignore` already excludes `.env` and heavy non-Go paths — done in this repo;
   add a CI assertion if desired.)
+  <!-- 2026-09-23: go job gains a govulncheck step (go install
+  golang.org/x/vuln/cmd/govulncheck@latest; govulncheck ./...) — call-graph aware, so it
+  only fails on advisories reaching code we actually run. New dep-audit job runs
+  pip-audit -r model/requirements.txt -r ml/requirements.txt against the pinned serving +
+  training deps, auditing the requirement files directly (no multi-GB torch install in
+  CI). Both fail the build on a known advisory (FR-013). .dockerignore already excludes
+  .env/.env.*/ml//model/ — left as-is; no CI assertion added (a redundant grep on a file
+  already reviewed is boilerplate nobody asked for). go build/vet/test -race all green;
+  pair-encoding self-check passes. -->
+
 
 **Checkpoint**: Supply chain reproducible; last input edges escaped; scan gating.
 
@@ -284,25 +317,87 @@ scan on a bad pin).
 **Independent Test**: quickstart V-ux (Check Run appears; label-removed appends one
 signal row; no serving-path state survives restart).
 
-- [ ] T020 [US5] `internal/github/github.go`: add `CreateCheckRun(ctx, owner, repo,
+- [x] T020 [US5] `internal/github/github.go`: add `CreateCheckRun(ctx, owner, repo,
   headSHA, conclusion, summary)` (POST `/repos/{o}/{r}/check-runs`); `internal/webhook`
   extracts the PR head SHA from the payload and, on a flagged verdict (and when not in
   shadow mode), creates a neutral/observational Check Run reporting the verdict +
   confidence — never a required/blocking status (FR-014). Fail-open on Check Run error;
   it MUST NOT block the label/comment path. Add tests (success + fail-open).
-- [ ] T021 [US5] Accept the additional webhook actions needed for feedback
+  <!-- 2026-09-23: github.CreateCheckRun posts status=completed + conclusion="neutral"
+  (never failing/blocking) with a fixed name so GitHub keys by (name, head_sha) and a
+  redelivery UPDATES rather than stacks; owner/repo path-escaped via esc() (FR-010);
+  goes through postJSON → doRetrying so it shares the budget-aware retry. webhook.go:
+  event.PullRequest.Head.SHA parsed, threaded onto job.headSHA; GitHub interface gained
+  CreateCheckRun; act(job,res) does label → comment → check run, each error logged not
+  fatal (check run last + least critical, so its failure can't block label/comment —
+  FR-014). Empty head SHA → log warn + skip (no fabricated SHA). Check run sits behind
+  the SAME shadow-mode gate as label/comment (shadow = zero outward writes). Added
+  checkRunSummary helper (reason/confidence/artifact + "observational, not required").
+  Tests: TestFlaggedCreatesNeutralCheckRun (1 check, headSHA abc123, conclusion neutral),
+  TestCheckRunFailureDoesNotBlockLabelComment (checkErr set → label+comment still 1 each),
+  TestFlaggedWithoutHeadSHASkipsCheckRun (no head sha → label+comment but 0 checks),
+  TestShadowModeSuppressesWrites extended to assert 0 checks. go build/vet OK; go test
+  ./... -race all green (github 5.1s, webhook 1.1s). -->
+
+## Feedback-loop decision (T021–T023)
+
+Per the Notes above and spec FR-015, T021–T023 introduce the project's ONLY
+persistence — an out-of-band, append-only feedback log. This was a maintainer
+call (serving-adjacent persistence). Resolved 2026-09-23: **build it** — async,
+off the request path, `FEEDBACK_LOG` unset disables it entirely.
+- [x] T021 [US5] Accept the additional webhook actions needed for feedback
   (`pull_request` `unlabeled`, and reaction/comment events if used) in
   `internal/webhook/webhook.go`; on a maintainer removing the slop label (or a 👎), map
   it to a feedback signal. Reject/ignore feedback for PRs Sentinel never flagged
   (no fabricated verdict) — see spec edge cases.
-- [ ] T022 [US5] Add an out-of-band, append-only signal writer (new file
+  <!-- 2026-09-23: `event` gained a `Label{Name}` field; `ServeHTTP` intercepts
+  `action=="unlabeled" && Label.Name==cfg.SlopLabel` AFTER parse but BEFORE the
+  actionable gate and bot-author skip (the actor is the maintainer, not the PR
+  author), dedups via the same ledger.Claim, and calls recordDisagreement. Keying
+  on the CONFIGURED slop label — which in normal operation only Sentinel applies —
+  makes a removal evidence Sentinel flagged the PR without any per-PR memory, so
+  the stateless gateway never fabricates a verdict for a PR it didn't flag (spec
+  edge case). Any other removed label is a normal non-actionable event (ignored).
+  Confidence is NOT persisted at flag time, so the signal omits it (never
+  fabricated); ponytail upgrade path = a persistent flag record if confidence-in-
+  signal is ever required. FEEDBACK_LOG unset → capture disabled, event still
+  acked. Config gained FeedbackLogPath (env FEEDBACK_LOG, "" disables). -->
+- [x] T022 [US5] Add an out-of-band, append-only signal writer (new file
   `internal/webhook/feedback.go`): append one JSON row {pr, original_verdict,
   confidence, disagreement_type, ts} to a configured path OUTSIDE the request path
   (buffered/async write; the request still acks fast and holds no state) (FR-015).
   Add `feedback_test.go` (one row per event; well-formed; no serving-path state).
-- [ ] T023 [US5] `ml/build_dataset.py`: add an optional `--feedback-log <path>` source
+  <!-- 2026-09-23: feedback.go adds Signal{PR, OriginalVerdict, Confidence
+  (omitempty), DisagreementType, TS} and FeedbackLog — a buffered channel
+  (cap 64) drained by ONE background goroutine that appends each Signal as a JSON
+  line (json.Encoder → JSONL) to the configured path. Record does a non-blocking
+  select-send (full buffer drops the signal, fail-open); the request path never
+  touches the file. Start()/Close() are idempotent; Close drains buffered signals
+  before returning (wired into Handler.Shutdown AFTER workers drain). An
+  unopenable file logs once and keeps draining the channel so senders never block.
+  ponytail: append-only local file, no rotation/fsync-per-write; ceiling = single-
+  host unbounded log; upgrade path = rotation or a durable store. feedback_test.go
+  covers: exactly one well-formed row per removal (PR/verdict/type/ts, zero GitHub
+  writes), unrelated-label removal records nothing, redelivery ×3 → 1 row, disabled
+  (FEEDBACK_LOG unset) still acks, and a normal flagged triage writes no feedback
+  row. go build/vet/test -race all green. -->
+- [x] T023 [US5] `ml/build_dataset.py`: add an optional `--feedback-log <path>` source
   that folds signal-log rows into the labeled dataset for retraining (FR-016);
   document the loop in the quickstart.
+  <!-- 2026-09-23: build_dataset.py gained --feedback-log. _parse_signal (pure,
+  network-free) resolves one JSONL signal to (repo, number) ONLY when
+  disagreement_type=="label-removed" and pr parses as owner/repo#n; every other
+  type or a malformed ref returns None (skipped, never guessed — no fabricated
+  label). _load_feedback fetches title+diff by PR identity (the log is identity-
+  only: the gateway never persists diff bodies, FR-001), reusing collect_prs.
+  _session/_fetch_diff rather than a second GitHub client, and labels each removed-
+  slop PR LEGIT (a maintainer overturning the slop verdict). Feedback rows join the
+  real pool, so they get the same stratified split + leakage check. Requires
+  GITHUB_TOKEN (raises SystemExit otherwise). ponytail: one blocking REST round-
+  trip per signal (fine for low-volume human feedback); upgrade path = batch/
+  GraphQL. test_build_dataset.py gained test_feedback_signal_parsing (6 skip/keep
+  cases). README Training section documents the loop; py_compile + self-checks
+  green. -->
 
 **Checkpoint**: Verdicts are first-class in the PR UI; maintainer judgment feeds back.
 
@@ -310,11 +405,26 @@ signal row; no serving-path state survives restart).
 
 ## Phase 8: Polish & Cross-Cutting
 
-- [ ] T024 Update `README.md`: document shadow mode, the `/stats` endpoint, the build
+- [x] T024 Update `README.md`: document shadow mode, the `/stats` endpoint, the build
   version flag, retry behavior, the Check Run, and the feedback loop + how to enable the
   extra webhook events.
-- [ ] T025 Final sweep: `go vet ./...`, `go test ./... -race`, `docker compose config`,
+  <!-- 2026-09-23: README Features section gained Check Run (observational/neutral),
+  shadow mode, bounded retry, and feedback-loop bullets; Configuration table gained
+  SHADOW_MODE, GITHUB_MAX_RETRIES, MODEL_THREADS, FEEDBACK_LOG rows; System Flow
+  "Act" step now shows label+comment+Check Run; Webhook section notes the Pull
+  requests event already delivers the unlabeled action (no extra event needed) and
+  that FEEDBACK_LOG enables capture; Training section documents closing the loop via
+  build_dataset --feedback-log; Design Decisions gained a stateless-serving-path
+  note. /stats + build version flag were already documented (T004/T008). -->
+- [x] T025 Final sweep: `go vet ./...`, `go test ./... -race`, `docker compose config`,
   and a log scan confirming no diff/secret leakage; record outcomes.
+  <!-- 2026-09-23: go vet ./... OK; go test ./... -race all green (config, github,
+  triage, verify, webhook); docker compose config OK (with placeholder secrets —
+  it correctly requires GITHUB_WEBHOOK_SECRET/GITHUB_TOKEN). Log-leak scan: grep of
+  every slog./log. call across internal/ + cmd/ for diff|token|secret|body|
+  signature → NONE. The feedback Signal persists identity + verdict + type + ts
+  only (no diff body, FR-001). py_compile ml/build_dataset.py OK; ml self-checks
+  pass. -->
 
 ---
 

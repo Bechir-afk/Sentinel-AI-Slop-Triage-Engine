@@ -51,6 +51,9 @@ type event struct {
 		User  struct {
 			Login string `json:"login"`
 		} `json:"user"`
+		Head struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
 	} `json:"pull_request"`
 	Repository struct {
 		Owner struct {
@@ -58,6 +61,11 @@ type event struct {
 		} `json:"owner"`
 		Name string `json:"name"`
 	} `json:"repository"`
+	// Label is populated on "labeled"/"unlabeled" actions — the label added or
+	// removed. A maintainer removing the slop label is the disagreement signal.
+	Label struct {
+		Name string `json:"name"`
+	} `json:"label"`
 }
 
 // Triager evaluates a code diff. Implemented by *triage.Client.
@@ -70,6 +78,7 @@ type GitHub interface {
 	FetchDiff(ctx context.Context, owner, repo string, number int) (string, error)
 	AddLabel(ctx context.Context, owner, repo string, number int, label string) error
 	PostComment(ctx context.Context, owner, repo string, number int, body string) error
+	CreateCheckRun(ctx context.Context, owner, repo, headSHA, conclusion, summary string) error
 }
 
 // job is one accepted delivery handed from the request goroutine to a worker.
@@ -82,6 +91,7 @@ type job struct {
 	number     int
 	title      string
 	author     string
+	headSHA    string
 }
 
 // Handler wires config + collaborators into an http.Handler for /webhook.
@@ -94,6 +104,7 @@ type Handler struct {
 
 	ledger    *Ledger
 	stats     Stats
+	feedback  *FeedbackLog // nil when FEEDBACK_LOG is unset (capture disabled)
 	jobs      chan job
 	wg        sync.WaitGroup
 	startOnce sync.Once
@@ -105,21 +116,30 @@ type Handler struct {
 func (h *Handler) Stats() Snapshot { return h.stats.Snapshot() }
 
 // New builds a webhook handler. Call Start to launch the worker pool before
-// serving, and Shutdown to drain it on exit.
+// serving, and Shutdown to drain it on exit. A non-empty feedbackPath enables
+// the out-of-band maintainer-disagreement log (FR-015); "" disables capture.
 func New(cfg config.Config, gh GitHub, triager Triager) *Handler {
-	return &Handler{
+	h := &Handler{
 		cfg:     cfg,
 		gh:      gh,
 		triager: triager,
 		ledger:  NewLedger(ledgerCapacity),
 		jobs:    make(chan job, queueCapacity),
 	}
+	if cfg.FeedbackLogPath != "" {
+		h.feedback = NewFeedbackLog(cfg.FeedbackLogPath)
+	}
+	return h
 }
 
 // Start launches the worker pool (idempotent). Worker count comes from config
-// (clamped to at least 1). Workers run until Shutdown closes the queue.
+// (clamped to at least 1). Workers run until Shutdown closes the queue. The
+// feedback-log writer (when enabled) is started alongside.
 func (h *Handler) Start() {
 	h.startOnce.Do(func() {
+		if h.feedback != nil {
+			h.feedback.Start()
+		}
 		workers := h.cfg.WorkerCount
 		if workers < 1 {
 			workers = 1
@@ -132,7 +152,8 @@ func (h *Handler) Start() {
 }
 
 // Shutdown stops accepting new jobs and waits for in-flight triage to drain,
-// bounded by ctx. It is safe to call once; a second call is a no-op.
+// bounded by ctx. It is safe to call once; a second call is a no-op. The
+// feedback log is flushed after workers drain so any queued signal is written.
 func (h *Handler) Shutdown(ctx context.Context) error {
 	h.stopOnce.Do(func() { close(h.jobs) })
 
@@ -143,6 +164,9 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		if h.feedback != nil {
+			h.feedback.Close()
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -201,6 +225,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
+
+	// Maintainer disagreement: removing the slop label is the feedback signal
+	// (FR-015). It arrives as a pull_request "unlabeled" action — not an
+	// actionable triage action — so capture it before the actionable gate drops
+	// it, and before the bot-author skip (the actor here is the maintainer, not
+	// the PR author). Only OUR slop label counts; any other removed label is a
+	// normal non-actionable event.
+	if ev.Action == "unlabeled" && ev.Label.Name == h.cfg.SlopLabel {
+		if !h.ledger.Claim(deliveryID) { // dedup redeliveries like any other event
+			writeOK(w, "duplicate delivery; skipped")
+			return
+		}
+		writeOK(w, h.recordDisagreement(deliveryID, ev))
+		return
+	}
+
 	if !actionable[ev.Action] {
 		writeOK(w, "ignored action: "+ev.Action)
 		return
@@ -228,6 +268,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		number:     ev.Number,
 		title:      ev.PullRequest.Title,
 		author:     author,
+		headSHA:    ev.PullRequest.Head.SHA,
 	}
 
 	// Non-blocking enqueue: a saturated queue fails open rather than holding the
@@ -243,6 +284,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"delivery", deliveryID, "owner", j.owner, "repo", j.repo, "pr", j.number)
 		writeOK(w, "queue full; skipped")
 	}
+}
+
+// recordDisagreement captures a maintainer removing the slop label as one
+// out-of-band feedback signal (FR-015) and returns the ack message. It is
+// off the request-critical path: the Record hand-off is non-blocking and the
+// file write happens on the feedback log's own goroutine, so the request still
+// acks fast and holds no state.
+//
+// We fire only on removal of OUR configured slop label (checked by the caller),
+// which in normal operation only Sentinel applies — so a removed slop label is
+// evidence Sentinel flagged the PR, without needing per-PR memory. The signal
+// records the honest fact "our slop label was removed"; it never fabricates a
+// confidence number for a verdict the stateless gateway can't recall (spec edge
+// case: never fabricate an original verdict).
+//
+// ponytail: confidence is not persisted at flag time (the gateway is
+// stateless), so the signal carries PR + verdict + type but omits confidence —
+// the offline ml/ join can recover it from the original flag comment if needed.
+// The upgrade path is stamping the verdict into a persistent flag record if
+// confidence-in-signal is ever required.
+func (h *Handler) recordDisagreement(deliveryID string, ev event) string {
+	pr := fmt.Sprintf("%s/%s#%d", ev.Repository.Owner.Login, ev.Repository.Name, ev.Number)
+	lg := slog.With("delivery", deliveryID, "pr", pr, "disagreement", "label-removed")
+
+	if h.feedback == nil {
+		lg.Info("slop label removed; feedback capture disabled (FEEDBACK_LOG unset)")
+		return "feedback capture disabled"
+	}
+
+	ok := h.feedback.Record(Signal{
+		PR:               pr,
+		OriginalVerdict:  "slop",
+		DisagreementType: "label-removed",
+		TS:               time.Now().UTC().Format(time.RFC3339),
+	})
+	if !ok {
+		lg.Warn("feedback buffer full; signal dropped")
+		return "feedback buffer full; skipped"
+	}
+	lg.Info("recorded maintainer disagreement")
+	return "feedback recorded"
 }
 
 // process runs stages 3-5 for one accepted job on a worker goroutine. Every
@@ -287,11 +369,11 @@ func (h *Handler) process(ctx context.Context, j job) {
 	// nothing outward — log the would-be action and stop. Lets an operator
 	// observe verdicts on real traffic before Sentinel ever speaks (FR-005).
 	if h.cfg.ShadowMode {
-		lg.Info("shadow mode: would flag (no label/comment written)",
+		lg.Info("shadow mode: would flag (no label/comment/check-run written)",
 			"confidence", res.Confidence, "reason", res.Reason)
 		return
 	}
-	h.act(ctx, lg, j.owner, j.repo, j.number, res)
+	h.act(ctx, lg, j, res)
 }
 
 // isBot reports whether a GitHub login is a bot account. GitHub App bots carry
@@ -300,14 +382,28 @@ func isBot(login string) bool {
 	return strings.HasSuffix(login, "[bot]")
 }
 
-// act applies the label then posts the comment. Errors are logged, not fatal:
-// a successful label with a failed comment is still useful.
-func (h *Handler) act(ctx context.Context, lg *slog.Logger, owner, repo string, num int, res *triage.Result) {
-	if err := h.gh.AddLabel(ctx, owner, repo, num, h.cfg.SlopLabel); err != nil {
+// act applies the label, posts the comment, then creates the observational Check
+// Run. Each is logged, not fatal: a successful label with a failed comment is
+// still useful, and the Check Run is the least critical of the three, so its
+// failure must not block the label/comment path (FR-014).
+func (h *Handler) act(ctx context.Context, lg *slog.Logger, j job, res *triage.Result) {
+	if err := h.gh.AddLabel(ctx, j.owner, j.repo, j.number, h.cfg.SlopLabel); err != nil {
 		lg.Error("add label failed", "err", err)
 	}
-	if err := h.gh.PostComment(ctx, owner, repo, num, comment(res)); err != nil {
+	if err := h.gh.PostComment(ctx, j.owner, j.repo, j.number, comment(res)); err != nil {
 		lg.Error("post comment failed", "err", err)
+	}
+	// Check Run: a first-class verdict in the PR's checks list, alongside the
+	// label + comment. Observational only — conclusion is "neutral", never a
+	// failing/blocking status, so it can never gate the PR (FR-014). GitHub keys
+	// it by (name, head_sha); a redelivery updates the run rather than stacking.
+	// Skipped when the payload carried no head SHA (nothing to attach to).
+	if j.headSHA == "" {
+		lg.Warn("no head SHA in payload; skipping check run")
+		return
+	}
+	if err := h.gh.CreateCheckRun(ctx, j.owner, j.repo, j.headSHA, "neutral", checkRunSummary(res)); err != nil {
+		lg.Error("create check run failed; label/comment unaffected", "err", err)
 	}
 }
 
@@ -327,6 +423,26 @@ func comment(res *triage.Result) string {
 		reason +
 		fmt.Sprintf("\n\n_Model confidence: %.0f%% · artifact: `%s`_", res.Confidence*100, version) +
 		"\n\nA maintainer will take a look. If you believe this was a mistake, please add context explaining the change. — _Sentinel_"
+}
+
+// checkRunSummary is the markdown body of the observational Check Run: the same
+// verdict facts as the comment (reason, confidence, artifact version), phrased
+// for the checks panel. It is informational only — the Check Run never gates the
+// PR (FR-014).
+func checkRunSummary(res *triage.Result) string {
+	reason := res.Reason
+	if reason == "" {
+		reason = "the change appears to be low-effort or automatically generated."
+	}
+	version := res.Version
+	if version == "" {
+		version = "unknown"
+	}
+	return fmt.Sprintf(
+		"Sentinel flagged this PR for human review because %s\n\n"+
+			"- **Confidence:** %.0f%%\n- **Artifact:** `%s`\n\n"+
+			"_This is an observational check, not a required status — it does not block merging._",
+		reason, res.Confidence*100, version)
 }
 
 func writeOK(w http.ResponseWriter, msg string) {

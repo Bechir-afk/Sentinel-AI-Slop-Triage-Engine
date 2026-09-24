@@ -14,10 +14,19 @@ Labeling caveat (PROJECT_MAP): "slop" is subjective. Synthetic examples are
 cleanly labeled by construction; real ones need human review — the manual
 bottleneck. --review-file flags real rows for a human to correct.
 
+Feedback source (FR-016): --feedback-log folds Sentinel's maintainer-disagreement
+log (internal/webhook/feedback.go) in as extra REAL rows. Each signal names a PR
+whose slop verdict a maintainer overturned (removed the label), so its corrected
+label is LEGIT. The log is identity-only (no diff), so we fetch title+diff by PR
+identity — hence a GITHUB_TOKEN is required only when --feedback-log is used.
+
 Not in serving path. Run offline.
 
 Usage:
     python build_dataset.py --raw raw_prs.jsonl --synthetic 800 --out dataset
+    # with the maintainer feedback loop folded in (needs GITHUB_TOKEN):
+    GITHUB_TOKEN=... python build_dataset.py --raw raw_prs.jsonl \
+        --feedback-log feedback.jsonl --out dataset
 """
 
 import argparse
@@ -55,6 +64,73 @@ def _load_raw(path: str):
             rows.append({"title": r["title"], "diff": r["diff"], "label": label})
     logger.info("loaded %d real rows from %s", len(rows), path)
     return rows
+
+
+def _parse_signal(sig: dict):
+    """Resolve one feedback signal to (repo, number), or None if it is not a
+    usable correction. Pure (no network) so the skip logic is testable offline.
+
+    A signal is usable only when a maintainer REMOVED the slop label
+    (disagreement_type == "label-removed") and the PR ref parses as owner/repo#n.
+    Anything else (other disagreement types, malformed pr) returns None — we never
+    guess a label for a PR we can't identify (spec: no fabricated verdict).
+    """
+    if sig.get("disagreement_type") != "label-removed":
+        return None
+    repo, sep, num = sig.get("pr", "").rpartition("#")
+    if not sep or not repo or not num.isdigit():
+        return None
+    return repo, int(num)
+
+
+def _load_feedback(path: str):
+    """Fold Sentinel's maintainer-disagreement log (FR-015/016) in as real rows.
+
+    Each JSONL signal is {pr:"owner/repo#n", original_verdict:"slop",
+    disagreement_type:"label-removed", ts, confidence?}. A removed slop label is a
+    maintainer overturning that verdict, so the CORRECTED label is LEGIT. The log
+    is identity-only (no diff — the gateway never persists diff bodies, FR-001), so
+    we fetch title+diff by PR identity via the same REST endpoints collect_prs
+    uses; that requires GITHUB_TOKEN. Signals we can't resolve (bad PR ref, empty
+    diff, non-label-removed types) are skipped, never guessed.
+
+    ponytail: reuses collect_prs._session/_fetch_diff rather than re-implementing a
+    GitHub client. Ceiling = one blocking REST round-trip per signal (fine for a
+    low-volume human-feedback log); upgrade path = batch/GraphQL if the log ever
+    grows large. Deferred import keeps `requests` off the pandas-free build path.
+    """
+    import collect_prs  # deferred: only --feedback-log needs a GitHub client
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise SystemExit("--feedback-log requires GITHUB_TOKEN to fetch PR title+diff")
+    s = collect_prs._session(token)
+
+    rows, skipped = [], 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parsed = _parse_signal(json.loads(line))
+            if parsed is None:
+                skipped += 1
+                continue
+            repo, num = parsed
+            diff = collect_prs._fetch_diff(s, repo, num)
+            title = _pr_title(collect_prs, s, repo, num)
+            if not diff:
+                skipped += 1
+                continue
+            rows.append({"title": title, "diff": diff, "label": LEGIT})
+    logger.info("loaded %d feedback rows from %s (%d skipped)", len(rows), path, skipped)
+    return rows
+
+
+def _pr_title(collect_prs, s, repo: str, number: int) -> str:
+    """Fetch just the PR title (the feedback log carries identity, not content)."""
+    r = s.get(f"{collect_prs.API}/repos/{repo}/pulls/{number}", timeout=30)
+    return r.json().get("title", "") if r.status_code == 200 else ""
 
 
 def _comment_only_diff(rng: random.Random) -> str:
@@ -199,9 +275,18 @@ def main():
     ap.add_argument("--synthetic", type=int, default=800)
     ap.add_argument("--out", default="dataset")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--feedback-log",
+        help="Sentinel maintainer-disagreement log (JSONL); folded in as real "
+        "LEGIT rows (FR-016). Requires GITHUB_TOKEN to fetch PR title+diff.",
+    )
     args = ap.parse_args()
 
     raw_rows = _load_raw(args.raw)
+    if args.feedback_log:
+        # Feedback rows are real (human-corrected), so they join the real pool and
+        # get stratified/leakage-checked like any other real row.
+        raw_rows += _load_feedback(args.feedback_log)
     splits = build(raw_rows, args.synthetic, args.seed)
     total = sum(len(v) for v in splits.values())
     logger.info("built %d rows across train/val/test; leakage check passed", total)

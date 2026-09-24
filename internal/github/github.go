@@ -73,6 +73,29 @@ func (c *Client) PostComment(ctx context.Context, owner, repo string, number int
 	return c.postJSON(ctx, url, payload)
 }
 
+// checkRunName is the fixed name Sentinel gives its Check Run. GitHub keys check
+// runs by (name, head_sha), so a redelivery for the same commit updates the
+// existing run instead of stacking duplicates.
+const checkRunName = "Sentinel AI-slop triage"
+
+// CreateCheckRun posts an observational Check Run on the PR head commit reporting
+// the verdict (stage 5, alongside the label + comment). It is always
+// status=completed; the caller passes a non-failing conclusion ("neutral") so
+// the run NEVER becomes a required or blocking status — Sentinel reports a
+// verdict, it does not gate the PR (FR-014). A crafted owner/repo is escaped like
+// every other path (FR-010).
+func (c *Client) CreateCheckRun(ctx context.Context, owner, repo, headSHA, conclusion, summary string) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/check-runs", c.base, esc(owner), esc(repo))
+	payload := map[string]any{
+		"name":       checkRunName,
+		"head_sha":   headSHA,
+		"status":     "completed",
+		"conclusion": conclusion,
+		"output":     map[string]string{"title": checkRunName, "summary": summary},
+	}
+	return c.postJSON(ctx, url, payload)
+}
+
 // esc path-escapes an owner or repo before it is interpolated into a REST URL.
 // GitHub owner/repo names are constrained, but the values arrive from the webhook
 // payload (a trust boundary), so a crafted "../" or slash-bearing segment must not

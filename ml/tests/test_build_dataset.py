@@ -55,9 +55,24 @@ def test_reproducible_with_same_seed():
     print("ok: reproducible with same seed")
 
 
+def test_feedback_signal_parsing():
+    # A removed slop label on a well-formed PR ref is the one usable correction.
+    assert bd._parse_signal(
+        {"pr": "octo/repo#7", "disagreement_type": "label-removed"}
+    ) == ("octo/repo", 7)
+    # Everything else is skipped (None), never guessed:
+    assert bd._parse_signal({"pr": "octo/repo#7", "disagreement_type": "👎"}) is None
+    assert bd._parse_signal({"pr": "octo/repo#7"}) is None  # missing type
+    assert bd._parse_signal({"pr": "no-number", "disagreement_type": "label-removed"}) is None
+    assert bd._parse_signal({"pr": "octo/repo#nan", "disagreement_type": "label-removed"}) is None
+    assert bd._parse_signal({"pr": "", "disagreement_type": "label-removed"}) is None
+    print("ok: feedback signal parsing skips unusable rows")
+
+
 if __name__ == "__main__":
     test_clean_build_has_no_leakage()
     test_planted_collision_is_caught()
     test_within_split_duplicate_is_allowed()
     test_reproducible_with_same_seed()
+    test_feedback_signal_parsing()
     print("all build_dataset self-checks passed")
