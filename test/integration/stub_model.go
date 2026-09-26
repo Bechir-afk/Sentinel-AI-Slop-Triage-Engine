@@ -35,6 +35,8 @@ type modelVerdict struct {
 type ModelStub struct {
 	Server *httptest.Server
 
+	closeOnce sync.Once // Close is idempotent: a drill may take the model down mid-test AND defer a cleanup Close
+
 	mu sync.Mutex
 	// health payload
 	threshold float64
@@ -117,8 +119,11 @@ func (m *ModelStub) predict(w http.ResponseWriter) {
 // URL is the base the gateway's MODEL_URL points at.
 func (m *ModelStub) URL() string { return m.Server.URL }
 
-// Close shuts the stub down (deferred by the harness).
-func (m *ModelStub) Close() { m.Server.Close() }
+// Close shuts the stub down (deferred by the harness). Idempotent: the
+// model-unreachable drill closes the server to simulate an outage, and the
+// per-case cleanup defers a second Close — httptest.Server.Close panics on a
+// double call, so guard it with a sync.Once.
+func (m *ModelStub) Close() { m.closeOnce.Do(func() { m.Server.Close() }) }
 
 // --- knobs (drills) ---
 

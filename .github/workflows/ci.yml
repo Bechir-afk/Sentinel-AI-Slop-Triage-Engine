@@ -26,6 +26,22 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
+  integration:
+    name: Integration (stub-model subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      # Black-box harness: it `go build`s the real gateway and runs it via
+      # os/exec against in-process net/http/httptest stubs (no torch, no
+      # multi-GB serving stack, no outbound internet, zero third-party Go deps).
+      # The real-model artifact drill self-skips here because torch/transformers
+      # aren't installed — exactly the intended stub-model subset (FR-012/FR-013).
+      - name: integration tests (race)
+        run: go test ./test/integration/... -race -count=1
+
   ml-selfchecks:
     name: ML offline self-checks
     runs-on: ubuntu-latest
@@ -43,6 +59,11 @@ jobs:
         run: python ml/tests/test_build_dataset.py
       - name: threshold selection check
         run: python ml/tests/test_thresholds.py
+      # The feedback fold-in round-trip is pure stdlib (fake GitHub in sys.modules,
+      # no requests/network/torch), so CI proves the production-learning path
+      # offline too (FR-008, SC-006).
+      - name: feedback round-trip check
+        run: python ml/tests/test_feedback_roundtrip.py
       # Pair-encoding correctness drives encode_pair with a fake tokenizer, so it
       # verifies the train/serve encoding invariant (SC-006) without torch.
       - name: pair-encoding check

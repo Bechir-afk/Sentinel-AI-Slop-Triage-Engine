@@ -268,8 +268,9 @@ Offline invariants have fast, dependency-light self-checks (stdlib + numpy, no
 torch):
 
 ```bash
-python ml/tests/test_build_dataset.py   # leakage assertion
-python ml/tests/test_thresholds.py      # threshold selection + softmax
+python ml/tests/test_build_dataset.py       # leakage assertion
+python ml/tests/test_thresholds.py          # threshold selection + softmax
+python ml/tests/test_feedback_roundtrip.py  # feedback fold-in round-trip (LEGIT, leakage-free)
 ```
 
 ---
@@ -279,13 +280,34 @@ python ml/tests/test_thresholds.py      # threshold selection + softmax
 ```bash
 go build ./...          # compile check
 go vet ./...            # static analysis
-go test ./... -race     # full suite, race detector
+go test ./... -race     # full suite, race detector (includes ./test/integration/...)
 ```
 
 All Go tests use `testing` + `net/http/httptest` fakes — **no live GitHub or
 model credentials required**. The async pipeline (gate → ack → worker pool →
 fetch diff → triage → label + comment), dedup, bot skip, body cap, and every
 fail-open path are covered.
+
+### Integration suite (black-box, on the real binary)
+
+`test/integration/` is a black-box driver: it `go build`s `./cmd/sentinel`,
+boots the shipped binary via `os/exec`, points `GITHUB_API_BASE`/`MODEL_URL` at
+in-process stubs by env, and asserts on the **real request bytes** the gateway
+sends. It never imports `internal/` and adds **zero** third-party Go deps.
+
+```bash
+go test ./test/integration/...   # bring-up, golden path, shadow/feedback, failure drills
+```
+
+- **Locally** this runs the full stub-backed stack. The one real-model drill
+  (`TestMissingArtifactFailsFastWithOneLine`) runs the actual `model/inference.py`
+  in a subprocess and **self-skips** when torch/transformers aren't installed.
+- **In CI** the dedicated `integration` job runs the same tests as a torch-free
+  **stub-model subset** — no multi-GB serving stack, no outbound internet.
+
+Every failure scenario in [docs/RUNBOOK.md](docs/RUNBOOK.md) names its paired
+check here, and `TestRunbookScenariosHaveChecks` fails the build if the runbook
+ever names a check that doesn't exist — the docs cannot drift from the code.
 
 ```bash
 docker compose config   # validate the two-service stack
