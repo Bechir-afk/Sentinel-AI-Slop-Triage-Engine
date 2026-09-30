@@ -24,6 +24,7 @@ ml/raw_prs.jsonl
 __pycache__/
 *.pyc
 .venv/
+.venv-ml/
 venv/
 *.egg-info/
 .pytest_cache/

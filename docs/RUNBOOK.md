@@ -20,6 +20,13 @@ drift from the code (constitution VIII, FR-011).
 refuses to start — see the missing-artifact drill), `GITHUB_WEBHOOK_SECRET`, and
 `GITHUB_TOKEN`. Copy `.env.example` → `.env` and fill those two in.
 
+`.env.example` currently omits `MODEL_THREADS` and `SHADOW_MODE`.
+`MODEL_THREADS` may be added to `.env`; Compose passes it to the model service
+with a default of `2`. The current `docker-compose.yml` does not pass
+`SHADOW_MODE` to the gateway, so adding it to `.env` alone does not enable
+observe-only mode. Compose-based shadow-mode verification is blocked until that
+wiring changes outside the read-only scope of `004-train-and-run`.
+
 ```bash
 docker compose up -d
 docker compose ps                 # both services → healthy
@@ -167,4 +174,3 @@ calls:
   unaffected — you are losing *coverage* (PRs going un-triaged), not correctness.
   Fix the downstream (model or GitHub reachability); no PR is ever harmed by the
   outage itself.
-
