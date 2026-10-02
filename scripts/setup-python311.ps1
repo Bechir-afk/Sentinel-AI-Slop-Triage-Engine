@@ -18,7 +18,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $venvPython -m pip install --no-deps --only-binary=:all: 'torch==2.5.1+cu124' --index-url 'https://download.pytorch.org/whl/cu124'
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-& $venvPython -m pip install --only-binary=:all: -r (Join-Path $repoRoot 'ml\requirements.txt')
+& $venvPython -m pip install --only-binary=:all: -r (Join-Path $repoRoot 'ml\requirements.txt') 'accelerate==1.1.0'
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & $venvPython -c "import torch; assert torch.cuda.is_available(), 'CUDA is unavailable'; print(f'CUDA ready: {torch.cuda.get_device_name(0)} ({torch.__version__})')"
